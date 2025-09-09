@@ -1,0 +1,83 @@
+version: 2
+
+sources:
+  - name: public
+    description: "Public schema tables from Postgres"
+    tables:
+      - name: companies
+        description: "Pharmaceutical and biotech companies"
+        columns:
+          - name: id
+            description: "Primary key"
+            tests:
+              - unique
+              - not_null
+          - name: canonical_name
+            description: "Company name"
+            tests:
+              - not_null
+              
+      - name: indications
+        description: "Medical indications/conditions"
+        columns:
+          - name: id
+            description: "Primary key"
+            tests:
+              - unique
+              - not_null
+          - name: label
+            description: "Indication name"
+            tests:
+              - not_null
+              
+      - name: trials
+        description: "Clinical trials"
+        columns:
+          - name: id
+            description: "Trial ID (NCT number)"
+            tests:
+              - unique
+              - not_null
+              
+      - name: trial_indications
+        description: "Many-to-many relationship between trials and indications"
+        columns:
+          - name: trial_id
+            description: "Reference to trials.id"
+            tests:
+              - not_null
+          - name: indication_id
+            description: "Reference to indications.id"
+            tests:
+              - not_null
+
+models:
+  - name: v_trial_funnel_by_indication
+    description: "Trial counts by phase for each indication"
+    columns:
+      - name: indication_id
+        description: "Indication ID"
+        tests:
+          - not_null
+      - name: phase
+        description: "Clinical trial phase"  
+      - name: trial_count
+        description: "Number of trials"
+        tests:
+          - not_null
+          
+  - name: v_upcoming_readouts
+    description: "Trials with completion dates in next 12 months"
+    columns:
+      - name: company_id
+        description: "Sponsor company ID"
+        tests:
+          - not_null
+      - name: trial_id
+        description: "Trial ID"
+        tests:
+          - not_null
+      - name: primary_completion_date
+        description: "Expected completion date"
+        tests:
+          - not_null

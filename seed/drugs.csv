@@ -1,0 +1,16 @@
+preferred_name,active_ingredient,mechanism,company_id
+Darolutamide,Darolutamide,Androgen receptor antagonist,1
+Palbociclib,Palbociclib,CDK4/6 inhibitor,1
+Tofacitinib,Tofacitinib,JAK inhibitor,1
+Pembrolizumab,Pembrolizumab,PD-1 inhibitor,5
+Adalimumab,Adalimumab,TNF inhibitor,6
+Ustekinumab,Ustekinumab,IL-12/23 inhibitor,2
+Secukinumab,Secukinumab,IL-17A inhibitor,4
+Dupilumab,Dupilumab,IL-4/IL-13 inhibitor,6
+Tirzepatide,Tirzepatide,GLP-1/GIP receptor agonist,8
+Semaglutide,Semaglutide,GLP-1 receptor agonist,4
+Nivolumab,Nivolumab,PD-1 inhibitor,7
+Aducanumab,Aducanumab,Anti-amyloid antibody,7
+Lecanemab,Lecanemab,Anti-amyloid antibody,8
+Donanemab,Donanemab,Anti-amyloid antibody,8
+Remdesivir,Remdesivir,RNA polymerase inhibitor,11

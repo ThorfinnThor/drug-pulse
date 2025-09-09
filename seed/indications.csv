@@ -1,0 +1,11 @@
+label,mesh_id,icd10,description
+Metastatic Castration-Resistant Prostate Cancer,D064129,C78.00,Advanced prostate cancer that has spread and no longer responds to hormone therapy
+Non-Small Cell Lung Cancer,D002289,C78.00,The most common type of lung cancer affecting epithelial cells
+Alzheimer Disease,D000544,F03,Progressive neurodegenerative disorder causing dementia
+Multiple Sclerosis,D009103,G35,Autoimmune disease of the central nervous system
+Rheumatoid Arthritis,D001172,M05,Chronic inflammatory disorder affecting joints
+Type 2 Diabetes Mellitus,D003924,E11,Metabolic disorder characterized by high blood sugar
+Atrial Fibrillation,D001281,I48,Heart rhythm disorder causing irregular heartbeat
+Major Depressive Disorder,D003865,F32,Mental health disorder characterized by persistent sadness
+Chronic Kidney Disease,D051436,N18,Progressive loss of kidney function over time
+Heart Failure,D006333,I50,Condition where heart cannot pump blood effectively

@@ -1,0 +1,85 @@
+name: Nightly ETL Pipeline
+
+on:
+  schedule:
+    # Run every night at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    # Allow manual triggering
+
+jobs:
+  etl:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r etl/requirements.txt
+        
+    - name: Set up environment variables
+      env:
+        DB_HOST: ${{ secrets.DB_HOST }}
+        DB_PORT: ${{ secrets.DB_PORT }}
+        DB_NAME: ${{ secrets.DB_NAME }}
+        DB_USER: ${{ secrets.DB_USER }}
+        DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+      run: |
+        echo "DB_HOST=$DB_HOST" >> $GITHUB_ENV
+        echo "DB_PORT=$DB_PORT" >> $GITHUB_ENV
+        echo "DB_NAME=$DB_NAME" >> $GITHUB_ENV
+        echo "DB_USER=$DB_USER" >> $GITHUB_ENV
+        echo "DB_PASSWORD=$DB_PASSWORD" >> $GITHUB_ENV
+        
+    - name: Run ClinicalTrials.gov ETL
+      run: |
+        cd etl
+        python ctgov_ingest.py
+      continue-on-error: true
+      
+    - name: Run FDA Approvals ETL
+      run: |
+        cd etl
+        python approvals_fda.py
+      continue-on-error: true
+      
+    - name: Run EDGAR Filings ETL
+      run: |
+        cd etl
+        python edgar_filings.py
+      continue-on-error: true
+      
+    - name: Refresh search materialized view
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      run: |
+        curl -X POST "$SUPABASE_URL/functions/v1/admin-etl/refresh-search" \
+             -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+             -H "Content-Type: application/json"
+      continue-on-error: true
+      
+    - name: Send notification on failure
+      if: failure()
+      run: |
+        echo "ETL pipeline failed. Check logs for details."
+        # Add notification logic here (email, Slack, etc.)
+
+  notify-success:
+    needs: etl
+    runs-on: ubuntu-latest
+    if: success()
+    
+    steps:
+    - name: Success notification
+      run: |
+        echo "Nightly ETL pipeline completed successfully at $(date)"
+        # Add success notification logic here

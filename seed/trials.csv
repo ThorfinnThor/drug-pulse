@@ -1,0 +1,21 @@
+id,title,phase,status,start_date,primary_completion_date,sponsor_company_id
+NCT05089890,Darolutamide Plus Androgen Deprivation Therapy in Prostate Cancer,3,Recruiting,2022-01-15,2026-12-31,1
+NCT04494425,Palbociclib in HR+ Breast Cancer,3,Active,2021-08-01,2025-06-30,1
+NCT05234567,Tofacitinib in Rheumatoid Arthritis,2,Completed,2020-03-15,2023-09-30,1
+NCT04567890,Pembrolizumab in NSCLC First Line,3,Active,2021-11-01,2025-10-31,5
+NCT03789012,Adalimumab Biosimilar Study,3,Recruiting,2022-05-01,2025-12-31,6
+NCT04123456,Ustekinumab in Psoriatic Arthritis,3,Active,2021-07-15,2024-11-30,2
+NCT05345678,Secukinumab in Ankylosing Spondylitis,2,Recruiting,2022-09-01,2026-03-31,4
+NCT04678901,Dupilumab in Atopic Dermatitis Pediatric,3,Active,2021-12-01,2025-08-15,6
+NCT05456789,Tirzepatide vs Semaglutide T2DM,3,Recruiting,2023-01-15,2026-06-30,8
+NCT04789123,Semaglutide Cardiovascular Outcomes,3,Active,2021-10-01,2025-05-31,4
+NCT05567890,Nivolumab Plus Ipilimumab Melanoma,3,Recruiting,2022-06-15,2026-01-31,7
+NCT04890234,Aducanumab Long-term Safety,4,Active,2021-09-01,2024-12-31,7
+NCT05678901,Lecanemab Early Alzheimer Disease,3,Recruiting,2022-11-01,2026-08-31,8
+NCT04901345,Donanemab vs Placebo Alzheimer,3,Active,2021-04-15,2025-09-30,8
+NCT05789012,Remdesivir COVID-19 Outpatient,2,Completed,2020-06-01,2022-03-31,11
+NCT04012456,Combination Immunotherapy NSCLC,2,Recruiting,2022-02-01,2025-11-30,1
+NCT05123789,Novel JAK Inhibitor RA,1,Recruiting,2023-03-01,2025-12-31,4
+NCT04234567,Anti-VEGF Diabetic Retinopathy,2,Active,2021-08-15,2024-10-31,2
+NCT05345012,CAR-T Cell Therapy Lymphoma,1,Recruiting,2022-12-01,2026-05-31,5
+NCT04456123,mRNA Vaccine Influenza,1,Active,2022-10-15,2025-03-31,14
