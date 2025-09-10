@@ -48,6 +48,13 @@ jobs:
         continue-on-error: true
 
       - name: Refresh search materialized view
-        run: |
-          psql $DATABASE_URL -c "refresh materialized view concurrently search_mv;"
-        continue-on-error: true
+      run: |
+        PGPASSWORD=${DB_PASSWORD} psql \
+      -h db.wahqfdgybivndsplphro.supabase.co \
+      -U postgres \
+      -d postgres \
+      "sslmode=require" \
+      -c "refresh materialized view concurrently search_mv;"
+  env:
+    DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+
