@@ -75,7 +75,7 @@ def fetch_recent_studies(days_back=1):
     logger.info(f"Fetching studies updated in last {days_back} days...")
     
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=days_back)
+    start_date = datetime.now() - timedelta(days=90) 
     
     url = f"{CTGOV_API_BASE}/studies"
     params = {
