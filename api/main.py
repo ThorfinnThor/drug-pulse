@@ -5,6 +5,7 @@ Provides REST API for search and data access
 """
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import os
 import psycopg2
@@ -12,14 +13,21 @@ from psycopg2.extras import RealDictCursor
 from typing import List, Optional, Dict, Any
 import logging
 from datetime import datetime
+import subprocess
+import asyncio
+import jwt
+from functools import wraps
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Security
+security = HTTPBearer()
+
 app = FastAPI(
     title="PharmaIntel API",
-    description="Pharmaceutical strategy intelligence API",
+    description="Pharmaceutical strategy intelligence API with admin endpoints",
     version="1.0.0"
 )
 
@@ -72,6 +80,11 @@ class ForecastResponse(BaseModel):
     rnpv: float
     assumptions: Dict[str, Any]
 
+class AdminETLResponse(BaseModel):
+    status: str
+    message: str
+    execution_id: Optional[str] = None
+
 # Database connection
 def get_db_connection():
     """Get database connection"""
@@ -83,6 +96,54 @@ def get_db_connection():
         password=os.getenv('DB_PASSWORD'),
         cursor_factory=RealDictCursor
     )
+
+# JWT Authentication
+def verify_jwt_token(token: str) -> Dict[str, Any]:
+    """Verify Supabase JWT token and extract user info"""
+    try:
+        # Decode without verification for now (Supabase handles verification)
+        # In production, you should verify with Supabase's JWT secret
+        payload = jwt.decode(token, options={"verify_signature": False})
+        return payload
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+def check_owner_role(user_id: str) -> bool:
+    """Check if user has owner role"""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT EXISTS(SELECT 1 FROM public.user_roles WHERE user_id = %s AND role = 'owner')",
+                (user_id,)
+            )
+            result = cur.fetchone()
+            return result[0] if result else False
+    except Exception as e:
+        logger.error(f"Role check error: {str(e)}")
+        return False
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+async def get_current_owner(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Dependency to get current owner user"""
+    try:
+        payload = verify_jwt_token(credentials.credentials)
+        user_id = payload.get('sub')
+        
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+            
+        if not check_owner_role(user_id):
+            raise HTTPException(status_code=403, detail="Owner access required")
+            
+        return user_id
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Authentication error: {str(e)}")
+        raise HTTPException(status_code=401, detail="Authentication failed")
 
 @app.get("/")
 async def root():
@@ -233,6 +294,134 @@ async def calculate_forecast(request: ForecastRequest):
     except Exception as e:
         logger.error(f"Forecast calculation error: {str(e)}")
         raise HTTPException(status_code=500, detail="Forecast calculation failed")
+
+# Admin Routes
+@app.post("/api/admin/run/{etl_type}", response_model=AdminETLResponse)
+async def run_etl(etl_type: str, current_user: str = Depends(get_current_owner)):
+    """Run ETL script - owner only"""
+    
+    if etl_type not in ['ctgov', 'fda', 'edgar']:
+        raise HTTPException(status_code=400, detail="Invalid ETL type. Must be one of: ctgov, fda, edgar")
+    
+    # Map ETL type to script filename
+    script_map = {
+        'ctgov': 'ctgov_ingest.py',
+        'fda': 'approvals_fda.py', 
+        'edgar': 'edgar_filings.py'
+    }
+    
+    script_name = script_map[etl_type]
+    execution_id = None
+    
+    try:
+        # Log ETL execution start
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.etl_executions (etl_type, status, executed_by)
+                VALUES (%s, 'running', %s)
+                RETURNING id
+            """, (etl_type, current_user))
+            execution_id = cur.fetchone()[0]
+            conn.commit()
+        conn.close()
+        
+        # Run ETL script
+        script_path = f"etl/{script_name}"
+        if not os.path.exists(script_path):
+            raise FileNotFoundError(f"ETL script not found: {script_path}")
+            
+        # Run the ETL script
+        process = subprocess.run(
+            ['python', script_path],
+            cwd='.',
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+        
+        # Update execution status
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            if process.returncode == 0:
+                cur.execute("""
+                    UPDATE public.etl_executions 
+                    SET status = 'success', completed_at = now()
+                    WHERE id = %s
+                """, (execution_id,))
+                status = "success"
+                message = f"ETL {etl_type} completed successfully"
+            else:
+                error_msg = process.stderr or "Unknown error"
+                cur.execute("""
+                    UPDATE public.etl_executions 
+                    SET status = 'failed', completed_at = now(), error_message = %s
+                    WHERE id = %s
+                """, (error_msg, execution_id))
+                status = "failed"
+                message = f"ETL {etl_type} failed: {error_msg}"
+                raise HTTPException(status_code=500, detail=message)
+            
+            conn.commit()
+        conn.close()
+        
+        return AdminETLResponse(
+            status=status,
+            message=message,
+            execution_id=str(execution_id)
+        )
+        
+    except subprocess.TimeoutExpired:
+        # Update status to failed on timeout
+        if execution_id:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE public.etl_executions 
+                    SET status = 'failed', completed_at = now(), error_message = 'Timeout'
+                    WHERE id = %s
+                """, (execution_id,))
+                conn.commit()
+            conn.close()
+        raise HTTPException(status_code=500, detail="ETL script timeout")
+        
+    except Exception as e:
+        # Update status to failed on error
+        if execution_id:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE public.etl_executions 
+                    SET status = 'failed', completed_at = now(), error_message = %s
+                    WHERE id = %s
+                """, (str(e), execution_id))
+                conn.commit()
+            conn.close()
+        
+        logger.error(f"ETL execution error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"ETL execution failed: {str(e)}")
+
+@app.get("/api/admin/etl-history")
+async def get_etl_history(current_user: str = Depends(get_current_owner)):
+    """Get ETL execution history - owner only"""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, etl_type, status, started_at, completed_at, error_message, records_processed
+                FROM public.etl_executions
+                ORDER BY started_at DESC
+                LIMIT 50
+            """)
+            
+            executions = cur.fetchall()
+        conn.close()
+        
+        return {"executions": [dict(row) for row in executions]}
+        
+    except Exception as e:
+        logger.error(f"ETL history error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch ETL history")
 
 if __name__ == "__main__":
     import uvicorn

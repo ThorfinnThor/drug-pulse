@@ -7,6 +7,8 @@ import Index from "./pages/Index";
 import { IndicationPage } from "./pages/IndicationPage";
 import { DrugPage } from "./pages/DrugPage";
 import { CompanyPage } from "./pages/CompanyPage";
+import AdminPage from "./pages/AdminPage";
+import AuthPage from "./pages/AuthPage";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -19,6 +21,8 @@ const App = () => (
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<Index />} />
+          <Route path="/auth" element={<AuthPage />} />
+          <Route path="/admin" element={<AdminPage />} />
           <Route path="/indication/:id" element={<IndicationPage indicationId={1} />} />
           <Route path="/drug/:id" element={<DrugPage drugId={1} />} />
           <Route path="/company/:id" element={<CompanyPage companyId={1} />} />
