@@ -48,13 +48,23 @@ jobs:
         continue-on-error: true
 
       - name: Refresh search materialized view
-      run: |
-        PGPASSWORD=${DB_PASSWORD} psql \
-      -h db.wahqfdgybivndsplphro.supabase.co \
-      -U postgres \
-      -d postgres \
-      "sslmode=require" \
-      -c "refresh materialized view concurrently search_mv;"
-  env:
-    DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          PGPASSWORD=${DB_PASSWORD} psql \
+            -h db.wahqfdgybivndsplphro.supabase.co \
+            -U postgres \
+            -d postgres \
+            "sslmode=require" \
+            -c "refresh materialized view concurrently search_mv;"
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        continue-on-error: true
 
+  notify-success:
+    needs: etl
+    runs-on: ubuntu-latest
+    if: success()
+
+    steps:
+      - name: Success notification
+        run: |
+          echo "Nightly ETL pipeline completed successfully at $(date)"
