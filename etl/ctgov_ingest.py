@@ -75,24 +75,39 @@ def fetch_recent_studies(days_back=90):
     end_date = datetime.today().strftime("%Y-%m-%d")
     start_date = (datetime.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
-    url = "https://clinicaltrials.gov/api/v2/studies"
+    url = f"{CTGOV_API_BASE}/studies"
     params = {
         "format": "json",
         "fields": "NCTId,BriefTitle,Phase,OverallStatus,StudyFirstPostDate,PrimaryCompletionDate,LeadSponsorName,Condition",
         "filter.lastUpdatePostDate.min": start_date,
         "filter.lastUpdatePostDate.max": end_date,
-        "pageSize": 1000
+        "pageSize": 1000,
+        "pageToken": None
     }
 
+    all_studies = []
     try:
-        resp = requests.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        studies = data.get("studies", [])
-        return studies
+        while True:
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            studies = data.get("studies", [])
+            all_studies.extend(studies)
+
+            # If there’s a nextPageToken, keep going
+            next_token = data.get("nextPageToken")
+            if not next_token:
+                break
+            params["pageToken"] = next_token
+
+        logger.info(f"Fetched {len(all_studies)} studies from ClinicalTrials.gov")
+        return all_studies
+
     except Exception as e:
-        print(f"Error fetching studies: {e}")
+        logger.error(f"Error fetching studies: {e}")
         return []
+
 
 def upsert_trials(studies, conn):
     """Upsert trials into database"""
