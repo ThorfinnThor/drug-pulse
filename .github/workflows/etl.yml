@@ -53,6 +53,6 @@ jobs:
 
       - name: Refresh search materialized view
         run: |
-          psql "$DATABASE_URL" -c "refresh materialized view concurrently search_mv;"
+          psql "$DATABASE_URL" -c "refresh materialized view search_mv;"
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
