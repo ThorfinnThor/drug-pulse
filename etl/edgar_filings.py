@@ -9,7 +9,6 @@ import psycopg2
 from dotenv import load_dotenv
 import logging
 from datetime import datetime
-import xml.etree.ElementTree as ET
 
 from db import get_db_connection 
 
@@ -26,31 +25,38 @@ def get_tracked_ciks(conn):
         return {row[1].zfill(10): row[0] for row in cur.fetchall()}  # pad to 10 digits
 
 
-def fetch_edgar_filings_for_cik(cik, count=10):
-    """Fetch EDGAR Atom feed for a single company"""
-    url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&owner=exclude&count={count}&output=atom"
-    headers = {"User-Agent": os.getenv("EDGAR_USER_AGENT", "PharmaIntel ETL contact@pharmaintel.com")}
-    
+def fetch_edgar_filings_for_cik(cik, limit=20):
+    """Fetch filings for a single company from SEC submissions JSON API"""
+    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+    headers = {
+        "User-Agent": os.getenv("EDGAR_USER_AGENT", "PharmaIntel ETL contact@pharmaintel.com")
+    }
+
     try:
         resp = requests.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
-
-        root = ET.fromstring(resp.content)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        data = resp.json()
 
         filings = []
-        for entry in root.findall("atom:entry", ns):
-            title = entry.find("atom:title", ns)
-            link = entry.find("atom:link", ns)
-            updated = entry.find("atom:updated", ns)
+        recent = data.get("filings", {}).get("recent", {})
+        forms = recent.get("form", [])
+        accession_numbers = recent.get("accessionNumber", [])
+        filing_dates = recent.get("filingDate", [])
+
+        for i in range(min(len(forms), limit)):
+            form = forms[i]
+            accession = accession_numbers[i]
+            filing_date = filing_dates[i]
 
             filings.append({
                 "cik": cik,
-                "form_type": title.text.split(" - ")[0] if title is not None else None,
-                "url": link.attrib.get("href") if link is not None else None,
-                "filing_date": updated.text if updated is not None else None,
+                "form_type": form,
+                "filing_date": filing_date,
+                "url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/{accession}-index.htm"
             })
+
         return filings
+
     except Exception as e:
         logger.warning(f"Error fetching EDGAR filings for {cik}: {e}")
         return []
@@ -65,17 +71,19 @@ def upsert_filings(filings, tracked_ciks, conn):
     """Insert or update filings in DB"""
     logger.info("Upserting SEC filings...")
 
-    relevant_forms = {"10-K", "10-Q", "8-K", "20-F", "S-1", "S-3"}
+    relevant_forms = ("10-K", "10-Q", "8-K", "20-F", "S-1", "S-3")
+    processed = 0
 
     with conn.cursor() as cur:
-        processed = 0
         for filing in filings:
             cik = filing.get("cik")
             form_type = filing.get("form_type")
 
             if not cik or not form_type:
                 continue
-            if cik not in tracked_ciks or form_type not in relevant_forms:
+            if cik not in tracked_ciks:
+                continue
+            if not any(form_type.startswith(f) for f in relevant_forms):
                 continue
 
             company_id = tracked_ciks[cik]
@@ -84,7 +92,7 @@ def upsert_filings(filings, tracked_ciks, conn):
                 filing_date = None
                 if filing.get("filing_date"):
                     try:
-                        filing_date = datetime.fromisoformat(filing["filing_date"].replace("Z", "+00:00")).date()
+                        filing_date = datetime.strptime(filing["filing_date"], "%Y-%m-%d").date()
                     except Exception:
                         pass
 
@@ -121,7 +129,7 @@ def main():
 
         all_filings = []
         for cik in tracked_ciks.keys():
-            filings = fetch_edgar_filings_for_cik(cik, count=10)
+            filings = fetch_edgar_filings_for_cik(cik, limit=20)
             all_filings.extend(filings)
 
         if all_filings:
