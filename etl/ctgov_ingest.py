@@ -14,6 +14,7 @@ import requests
 from dotenv import load_dotenv
 
 from db import get_db_connection
+from typing import Optional
 
 load_dotenv()
 
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 CTGOV_V2 = "https://clinicaltrials.gov/api/v2/studies"
 
 
-def _safe_date(d: str | None) -> datetime.date | None:
+def _safe_date(d: Optional[str]) -> Optional[datetime.date]:
     """Parse YYYY-MM-DD to date; return None if invalid."""
     if not d:
         return None
@@ -34,6 +35,7 @@ def _safe_date(d: str | None) -> datetime.date | None:
         return datetime.strptime(d, "%Y-%m-%d").date()
     except Exception:
         return None
+
 
 
 def _extract_phase(design_module: dict) -> str:
