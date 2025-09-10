@@ -68,36 +68,48 @@ def fuzzy_match_indication(condition, conn):
     return None
 
 def fetch_recent_approvals(days_back=365):
-    """Fetch recent FDA drug approvals"""
-    logger.info(f"Fetching FDA approvals from last {days_back} days...")
-    
-    end_date = datetime.today()
-    start_date = end_date - timedelta(days=days_back)
-    
-    start_date_str = start_date.strftime('%Y%m%d')
-    end_date_str = end_date.strftime('%Y%m%d')
-    
+    """Fetch FDA approvals and filter locally by submission_date"""
+    logger.info(f"Fetching FDA approvals (last {days_back} days)...")
+
     url = f"{FDA_API_BASE}/drug/drugsfda.json"
-    params = {
-        "search": f"submissions.submission_date:[{start_date_str}+TO+{end_date_str}]",
-        "limit": 100
-    }
+    params = {"limit": 100}  # just fetch latest 100 approvals
 
     try:
         resp = requests.get(url, params=params, timeout=30)
         if resp.status_code == 404:
-            logger.info("No FDA approvals found in this window")
+            logger.info("No FDA approvals found")
             return []
         resp.raise_for_status()
 
         data = resp.json()
         approvals = data.get("results", [])
-        logger.info(f"Fetched {len(approvals)} FDA approval records")
-        return approvals
+
+        cutoff_date = datetime.today() - timedelta(days=days_back)
+        filtered = []
+
+        for app in approvals:
+            submissions = app.get("submissions", [])
+            for sub in submissions:
+                sub_date = sub.get("submission_date")
+                if not sub_date:
+                    continue
+                try:
+                    # FDA uses YYYYMMDD format
+                    sub_dt = datetime.strptime(sub_date, "%Y%m%d").date()
+                except ValueError:
+                    continue
+
+                if sub_dt >= cutoff_date.date():
+                    filtered.append(app)
+                    break  # keep each approval only once if any submission is recent
+
+        logger.info(f"Fetched {len(filtered)} FDA approval records after filtering")
+        return filtered
 
     except Exception as e:
         logger.error(f"Error fetching FDA approvals: {e}")
         return []
+
 
 def upsert_approvals(approvals, conn):
     """Upsert approvals into database"""
