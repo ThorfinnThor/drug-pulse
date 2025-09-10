@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 # OpenFDA API base URL
 FDA_API_BASE = "https://api.fda.gov"
+url = f"{FDA_API_BASE}/drug/drugsfda.json"
 
 def fuzzy_match_drug(drug_name, conn):
     """Fuzzy match drug name to existing drug"""
