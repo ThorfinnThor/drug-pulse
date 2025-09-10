@@ -69,7 +69,7 @@ def fuzzy_match_drug(conn, name: str | None) -> int | None:
         return row[0] if row else None
 
 
-def fetch_recent_approvals(days_back=365, max_pages=5):
+def fetch_approvals(days_back=365, max_pages=5):
     """Fetch FDA approvals, paginated, and filter locally by submission_date."""
     logger.info(f"Fetching FDA approvals (last {days_back} days)...")
 
