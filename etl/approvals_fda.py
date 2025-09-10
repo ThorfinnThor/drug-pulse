@@ -67,34 +67,19 @@ def fuzzy_match_indication(condition, conn):
     
     return None
 
-def fetch_recent_approvals(days_back=30):
-    """Fetch recent FDA drug approvals"""
-    logger.info(f"Fetching FDA approvals from last {days_back} days...")
-    
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days_back)
-    
-    # Format dates for FDA API (YYYYMMDD)
-    start_date_str = start_date.strftime('%Y%m%d')
-    end_date_str = end_date.strftime('%Y%m%d')
-    
-    url = f"{FDA_API_BASE}/drug/drugsfda.json"
-    params = {
-        'search': f'submissions.submission_date:[{start_date_str} TO {end_date_str}]',
-        'limit': 1000
-    }
-    
+def fetch_recent_approvals(limit=100):
+    """Fetch recent FDA approvals (drugsfda dataset)"""
+    url = "https://api.fda.gov/drug/drugsfda.json"
+    params = {"limit": limit}
+
     try:
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        approvals = data.get('results', [])
-        logger.info(f"Fetched {len(approvals)} FDA drug records")
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        approvals = data.get("results", [])
         return approvals
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching FDA approvals: {str(e)}")
+    except Exception as e:
+        print(f"Error fetching FDA approvals: {e}")
         return []
 
 def upsert_approvals(approvals, conn):
