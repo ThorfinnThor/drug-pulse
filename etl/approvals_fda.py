@@ -166,7 +166,7 @@ def main():
         conn = get_db_connection()
         logger.info("Connected to database")
 
-        days_back = int(os.getenv("FDA_DAYS_BACK", "30"))
+        days_back = int(os.getenv("FDA_DAYS_BACK", "365"))
         approvals = fetch_recent_approvals(days_back=days_back, max_pages=6)
 
         if approvals:
