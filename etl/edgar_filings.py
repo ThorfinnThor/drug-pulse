@@ -1,16 +1,3 @@
-# etl/ctgov_ingest.py
-from db import get_db_connection
-
-def main():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    # your ETL logic...
-    conn.commit()
-    conn.close()
-
-if __name__ == "__main__":
-    main()
-
 #!/usr/bin/env python3
 """
 SEC EDGAR Filings ETL Script
@@ -24,6 +11,8 @@ import logging
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 import re
+
+from db import get_db_connection 
 
 load_dotenv()
 
