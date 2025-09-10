@@ -6,11 +6,9 @@ Fetches FDA drug approvals from openFDA API and upserts into database
 import os
 import requests
 import psycopg2
-from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 import logging
 from datetime import datetime, timedelta
-import json
 
 from db import get_db_connection 
 
@@ -21,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # OpenFDA API base URL
 FDA_API_BASE = "https://api.fda.gov"
-url = f"{FDA_API_BASE}/drug/drugsfda.json"
+
 
 def fuzzy_match_drug(drug_name, conn):
     """Fuzzy match drug name to existing drug"""
@@ -51,64 +49,54 @@ def fuzzy_match_drug(drug_name, conn):
     
     return None
 
-def fuzzy_match_indication(condition, conn):
-    """Fuzzy match indication"""
-    with conn.cursor() as cur:
-        cur.execute(
-            """SELECT id FROM public.indications 
-               WHERE LOWER(label) LIKE LOWER(%s) 
-               OR LOWER(description) LIKE LOWER(%s)
-               LIMIT 1""",
-            (f"%{condition}%", f"%{condition}%")
-        )
-        result = cur.fetchone()
-        if result:
-            return result[0]
-    
-    return None
 
-def fetch_recent_approvals(days_back=365):
+def fetch_recent_approvals(days_back=365, max_pages=5):
     """Fetch FDA approvals and filter locally by submission_date"""
     logger.info(f"Fetching FDA approvals (last {days_back} days)...")
 
     url = f"{FDA_API_BASE}/drug/drugsfda.json"
-    params = {"limit": 100}  # just fetch latest 100 approvals
+    cutoff_date = datetime.today() - timedelta(days=days_back)
 
-    try:
-        resp = requests.get(url, params=params, timeout=30)
-        if resp.status_code == 404:
-            logger.info("No FDA approvals found")
-            return []
-        resp.raise_for_status()
+    all_filtered = []
+    page_size = 100
 
-        data = resp.json()
-        approvals = data.get("results", [])
+    for page in range(max_pages):  # fetch multiple pages
+        params = {"limit": page_size, "skip": page * page_size}
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            if resp.status_code == 404:
+                logger.info("No FDA approvals found")
+                break
+            resp.raise_for_status()
 
-        cutoff_date = datetime.today() - timedelta(days=days_back)
-        filtered = []
+            data = resp.json()
+            approvals = data.get("results", [])
+            if not approvals:
+                break  # no more data
 
-        for app in approvals:
-            submissions = app.get("submissions", [])
-            for sub in submissions:
-                sub_date = sub.get("submission_date")
-                if not sub_date:
-                    continue
-                try:
-                    # FDA uses YYYYMMDD format
-                    sub_dt = datetime.strptime(sub_date, "%Y%m%d").date()
-                except ValueError:
-                    continue
+            for app in approvals:
+                submissions = app.get("submissions", [])
+                for sub in submissions:
+                    sub_date = sub.get("submission_date")
+                    if not sub_date:
+                        continue
+                    try:
+                        # pad if date is shorter than 8 chars
+                        sub_date = sub_date.ljust(8, "0")
+                        sub_dt = datetime.strptime(sub_date, "%Y%m%d").date()
+                    except ValueError:
+                        continue
 
-                if sub_dt >= cutoff_date.date():
-                    filtered.append(app)
-                    break  # keep each approval only once if any submission is recent
+                    if sub_dt >= cutoff_date.date():
+                        all_filtered.append(app)
+                        break  # only include once per application
 
-        logger.info(f"Fetched {len(filtered)} FDA approval records after filtering")
-        return filtered
+        except Exception as e:
+            logger.error(f"Error fetching FDA approvals: {e}")
+            break
 
-    except Exception as e:
-        logger.error(f"Error fetching FDA approvals: {e}")
-        return []
+    logger.info(f"Fetched {len(all_filtered)} FDA approval records after filtering")
+    return all_filtered
 
 
 def upsert_approvals(approvals, conn):
@@ -117,7 +105,8 @@ def upsert_approvals(approvals, conn):
     
     with conn.cursor() as cur:
         processed = 0
-        
+        sample_logged = 0  # track how many we log visibly
+
         for approval in approvals:
             try:
                 # Extract drug information
@@ -148,8 +137,10 @@ def upsert_approvals(approvals, conn):
                         continue
                     
                     try:
+                        # pad date if shorter than 8 chars
+                        submission_date = submission_date.ljust(8, "0")
                         approval_date = datetime.strptime(submission_date, '%Y%m%d').date()
-                    except:
+                    except Exception:
                         continue
                     
                     application_docs = submission.get('application_docs', [])
@@ -169,7 +160,13 @@ def upsert_approvals(approvals, conn):
                                 approval.get('application_number', '')
                             ))
                             processed += 1
-                            break
+
+                            # log the first 5 we insert
+                            if sample_logged < 5:
+                                logger.info(f"Inserted: {drug_name} on {approval_date}")
+                                sample_logged += 1
+
+                            break  # only log one doc per submission
                 
             except Exception as e:
                 logger.warning(f"Error processing approval record: {str(e)}")
@@ -177,6 +174,7 @@ def upsert_approvals(approvals, conn):
         
         conn.commit()
         logger.info(f"Processed {processed} FDA approval records")
+
 
 def main():
     """Main ETL function"""
@@ -195,11 +193,12 @@ def main():
             logger.info("No approvals to process")
             
     except Exception as e:
-        logger.error(f"ETL failed: {str(e)}")
+        logger.error(f"ETL failed: {e}")
         raise
     finally:
         if 'conn' in locals():
             conn.close()
+
 
 if __name__ == "__main__":
     main()
