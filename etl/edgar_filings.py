@@ -22,15 +22,6 @@ logger = logging.getLogger(__name__)
 # SEC EDGAR RSS URL
 EDGAR_RSS_URL = "https://www.sec.gov/Archives/edgar/xbrlrss.xml"
 
-def get_db_connection():
-    """Get database connection"""
-    return psycopg2.connect(
-        host=os.getenv('DB_HOST', 'db.wahqfdgybivndsplphro.supabase.co'),
-        port=os.getenv('DB_PORT', '5432'),
-        database=os.getenv('DB_NAME', 'postgres'),
-        user=os.getenv('DB_USER', 'postgres'),
-        password=os.getenv('DB_PASSWORD')
-    )
 
 def get_tracked_ciks(conn):
     """Get list of CIKs we want to track from companies table"""
