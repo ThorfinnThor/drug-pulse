@@ -180,7 +180,7 @@ def main():
         logger.info("Connected to database")
 
         days_back = int(os.getenv("FDA_DAYS_BACK", "30"))
-        approvals = fetch_approvals(days_back=days_back, max_pages=6, page_size=100)
+        approvals = fetch_recent_approvals(days_back=days_back, max_pages=6)
 
         if not approvals:
             logger.info("No approvals fetched.")
