@@ -22,16 +22,6 @@ logger = logging.getLogger(__name__)
 # OpenFDA API base URL
 FDA_API_BASE = "https://api.fda.gov"
 
-def get_db_connection():
-    """Get database connection"""
-    return psycopg2.connect(
-        host=os.getenv('DB_HOST', 'db.wahqfdgybivndsplphro.supabase.co'),
-        port=os.getenv('DB_PORT', '5432'),
-        database=os.getenv('DB_NAME', 'postgres'),
-        user=os.getenv('DB_USER', 'postgres'),
-        password=os.getenv('DB_PASSWORD')
-    )
-
 def fuzzy_match_drug(drug_name, conn):
     """Fuzzy match drug name to existing drug"""
     with conn.cursor() as cur:
