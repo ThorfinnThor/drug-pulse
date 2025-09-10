@@ -69,52 +69,54 @@ def fuzzy_match_drug(conn, name: str | None) -> int | None:
         return row[0] if row else None
 
 
-def fetch_approvals(days_back: int = 30, max_pages: int = 5, page_size: int = 100) -> list[dict]:
-    """
-    Pull several pages (limit/skip). Filter locally by submission_date >= cutoff.
-    """
-    cutoff = (datetime.utcnow() - timedelta(days=days_back)).date()
-    collected = []
+def fetch_recent_approvals(days_back=365, max_pages=5):
+    """Fetch FDA approvals, paginated, and filter locally by submission_date."""
+    logger.info(f"Fetching FDA approvals (last {days_back} days)...")
+
+    cutoff_date = datetime.today() - timedelta(days=days_back)
+    all_results = []
+
+    url = f"{FDA_API_BASE}/drug/drugsfda.json"
 
     for page in range(max_pages):
-        params = {"limit": page_size, "skip": page * page_size}
+        params = {"limit": 100, "skip": page * 100}
         try:
-            r = requests.get(OPENFDA, params=params, timeout=40)
-            if r.status_code == 404:
+            resp = requests.get(url, params=params, timeout=30)
+            if resp.status_code == 404:
+                logger.info("No FDA approvals found on this page")
                 break
-            r.raise_for_status()
-            items = (r.json().get("results") or [])
-            if not items:
-                break
+            resp.raise_for_status()
 
-            for app in items:
-                subs = app.get("submissions") or []
-                # include if ANY submission is recent
-                include = False
-                for s in subs:
-                    dt = _safe_sub_date(s.get("submission_date"))
-                    if dt and dt >= cutoff:
-                        include = True
-                        break
-                if include:
-                    collected.append(app)
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                break  # no more pages
+
+            all_results.extend(results)
+
         except Exception as e:
-            logger.error(f"Error fetching FDA approvals: {e}")
+            logger.error(f"Error fetching FDA approvals page {page}: {e}")
             break
 
-    # Fallback so you actually get rows if nothing matched the date filter
-    if not collected:
-        logger.info("No FDA approvals matched recent window. Falling back to first page (unfiltered).")
-        try:
-            r = requests.get(OPENFDA, params={"limit": page_size, "skip": 0}, timeout=40)
-            if r.status_code != 404:
-                r.raise_for_status()
-                collected = r.json().get("results") or []
-        except Exception as e:
-            logger.error(f"Fallback fetch failed: {e}")
+    # Filter by submission_date
+    filtered = []
+    for app in all_results:
+        submissions = app.get("submissions", [])
+        for sub in submissions:
+            sub_date = sub.get("submission_date")
+            if not sub_date:
+                continue
+            try:
+                sub_dt = datetime.strptime(sub_date, "%Y%m%d").date()
+            except ValueError:
+                continue
+            if sub_dt >= cutoff_date.date():
+                filtered.append(app)
+                break  # keep once per approval
 
-    logger.info(f"Approvals fetched for processing: {len(collected)}")
-    return collected
+    logger.info(f"Fetched {len(filtered)} FDA approval records after filtering")
+    return filtered
+
 
 
 def upsert_approvals(conn, approvals: list[dict]) -> int:
