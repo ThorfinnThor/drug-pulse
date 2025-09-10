@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import psycopg2
 import requests
 from dotenv import load_dotenv
+from typing import Optional
 
 from db import get_db_connection
 
@@ -27,15 +28,15 @@ logger = logging.getLogger(__name__)
 OPENFDA = "https://api.fda.gov/drug/drugsfda.json"
 
 
-def _safe_sub_date(s: str | None) -> datetime.date | None:
-    """openFDA uses YYYYMMDD; pad shorter ones; return None if invalid."""
+def _safe_sub_date(s: Optional[str]) -> Optional[datetime.date]:
+    """Parse YYYYMMDD submission date to date; return None if invalid."""
     if not s:
         return None
     try:
-        s = s.ljust(8, "0")
         return datetime.strptime(s, "%Y%m%d").date()
     except Exception:
         return None
+
 
 
 def fuzzy_match_drug(conn, name: str | None) -> int | None:
