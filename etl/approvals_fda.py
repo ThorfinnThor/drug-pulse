@@ -67,19 +67,36 @@ def fuzzy_match_indication(condition, conn):
     
     return None
 
-def fetch_recent_approvals(limit=100):
-    """Fetch recent FDA approvals (drugsfda dataset)"""
-    url = "https://api.fda.gov/drug/drugsfda.json"
-    params = {"limit": limit}
+def fetch_recent_approvals(days_back=365):
+    """Fetch recent FDA drug approvals"""
+    logger.info(f"Fetching FDA approvals from last {days_back} days...")
+    
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=days_back)
+    
+    start_date_str = start_date.strftime('%Y%m%d')
+    end_date_str = end_date.strftime('%Y%m%d')
+    
+    url = f"{FDA_API_BASE}/drug/drugsfda.json"
+    params = {
+        "search": f"submissions.submission_date:[{start_date_str}+TO+{end_date_str}]",
+        "limit": 100
+    }
 
     try:
         resp = requests.get(url, params=params, timeout=30)
+        if resp.status_code == 404:
+            logger.info("No FDA approvals found in this window")
+            return []
         resp.raise_for_status()
+
         data = resp.json()
         approvals = data.get("results", [])
+        logger.info(f"Fetched {len(approvals)} FDA approval records")
         return approvals
+
     except Exception as e:
-        print(f"Error fetching FDA approvals: {e}")
+        logger.error(f"Error fetching FDA approvals: {e}")
         return []
 
 def upsert_approvals(approvals, conn):
