@@ -70,49 +70,29 @@ def extract_phase(phase_str):
     else:
         return 'N/A'
 
-def fetch_recent_studies(days_back=1):
-    """Fetch studies updated in the last N days"""
-    logger.info(f"Fetching studies updated in last {days_back} days...")
-    
-    end_date = datetime.now()
-    start_date = datetime.now() - timedelta(days=90) 
-    
-    url = f"{CTGOV_API_BASE}/studies"
+def fetch_recent_studies(days_back=90):
+    """Fetch clinical trials updated in the last N days"""
+    end_date = datetime.today().strftime("%Y-%m-%d")
+    start_date = (datetime.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+
+    url = "https://clinicaltrials.gov/api/v2/studies"
     params = {
-        'format': 'json',
-        'fields': 'NCTId,BriefTitle,Phase,OverallStatus,StudyFirstPostDate,PrimaryCompletionDate,LeadSponsorName,Condition',
-        'filter.lastUpdatePostDate.min': start_date.strftime('%Y-%m-%d'),
-        'pageSize': 1000
+        "format": "json",
+        "fields": "NCTId,BriefTitle,Phase,OverallStatus,StudyFirstPostDate,PrimaryCompletionDate,LeadSponsorName,Condition",
+        "filter.lastUpdatePostDate.min": start_date,
+        "filter.lastUpdatePostDate.max": end_date,
+        "pageSize": 1000
     }
-    
-    studies = []
-    page_token = None
-    
-    while True:
-        if page_token:
-            params['pageToken'] = page_token
-            
-        try:
-            response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            
-            if 'studies' in data:
-                studies.extend(data['studies'])
-                logger.info(f"Fetched {len(data['studies'])} studies, total: {len(studies)}")
-            
-            # Check for next page
-            if 'nextPageToken' in data:
-                page_token = data['nextPageToken']
-            else:
-                break
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching studies: {str(e)}")
-            break
-    
-    logger.info(f"Total studies fetched: {len(studies)}")
-    return studies
+
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        studies = data.get("studies", [])
+        return studies
+    except Exception as e:
+        print(f"Error fetching studies: {e}")
+        return []
 
 def upsert_trials(studies, conn):
     """Upsert trials into database"""
