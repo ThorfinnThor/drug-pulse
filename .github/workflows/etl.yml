@@ -1,23 +1,17 @@
 name: Nightly ETL Pipeline
 
 on:
+  workflow_dispatch:
   schedule:
-    # Run every night at 2 AM UTC
-    - cron: '0 2 * * *'
-  workflow_dispatch: {} # Allow manual triggering
+    - cron: "0 0 * * *"
 
 jobs:
   etl:
     runs-on: ubuntu-latest
 
-    env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
-      OPENFDA_API_KEY: ${{ secrets.OPENFDA_API_KEY }}
-
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -26,45 +20,39 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r etl/requirements.txt
+          cd etl
+          pip install -r requirements.txt
+
+      # ✅ Quick DB connection test
+      - name: Test DB Connection
+        run: |
+          psql "$DATABASE_URL" -c "select now();"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
       - name: Run ClinicalTrials.gov ETL
         run: |
           cd etl
           python ctgov_ingest.py
-        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
       - name: Run FDA Approvals ETL
         run: |
           cd etl
           python approvals_fda.py
-        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
       - name: Run EDGAR Filings ETL
         run: |
           cd etl
           python edgar_filings.py
-        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
       - name: Refresh search materialized view
         run: |
-          PGPASSWORD=${DB_PASSWORD} psql \
-            -h db.wahqfdgybivndsplphro.supabase.co \
-            -U postgres \
-            -d postgres \
-            "sslmode=require" \
-            -c "refresh materialized view concurrently search_mv;"
+          psql "$DATABASE_URL" -c "refresh materialized view concurrently search_mv;"
         env:
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-        continue-on-error: true
-
-  notify-success:
-    needs: etl
-    runs-on: ubuntu-latest
-    if: success()
-
-    steps:
-      - name: Success notification
-        run: |
-          echo "Nightly ETL pipeline completed successfully at $(date)"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
