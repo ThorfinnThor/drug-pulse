@@ -6,6 +6,9 @@ import json
 import logging
 from datetime import datetime, timedelta
 
+from psycopg2 import extras
+logger = logging.getLogger(__name__)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -50,23 +53,17 @@ def fetch_fda_approvals(limit=100, max_skip=1000):
 # -----------------------------
 # Upsert approvals into DB
 # -----------------------------
-def upsert_approvals(approvals):
-    if not approvals:
-        logging.info("No approvals to process")
-        return
-
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
+def upsert_approvals(approvals, conn):
+    """Upsert approvals into database with deduplication"""
+    logger.info("Processing FDA approvals...")
 
     rows = []
-    for approval in approvals:
-        submissions = approval.get("submissions", [])
-        products = approval.get("products", [])
-
+    for app in approvals:
+        submissions = app.get("submissions", [])
         for sub in submissions:
             rows.append((
-                approval.get("application_number"),
-                approval.get("sponsor_name"),
+                app.get("application_number"),
+                app.get("sponsor_name"),
                 sub.get("submission_type"),
                 sub.get("submission_number"),
                 sub.get("submission_status"),
@@ -75,8 +72,19 @@ def upsert_approvals(approvals):
                 sub.get("submission_class_code"),
                 sub.get("submission_class_code_description"),
                 sub.get("submission_date"),
-                json.dumps(products)  # ✅ ensure JSON not text[]
+                app.get("products")
             ))
+
+    # ✅ Deduplicate rows by (application_number, submission_number)
+    seen = set()
+    deduped = []
+    for row in rows:
+        key = (row[0], row[3])  # (application_number, submission_number)
+        if key not in seen:
+            deduped.append(row)
+            seen.add(key)
+
+    logger.info(f"Upserting {len(deduped)} unique rows into approvals...")
 
     query = """
         INSERT INTO approvals (
@@ -92,20 +100,14 @@ def upsert_approvals(approvals):
             submission_type = EXCLUDED.submission_type,
             submission_status = EXCLUDED.submission_status,
             submission_status_date = EXCLUDED.submission_status_date,
-            review_priority = EXCLUDED.review_priority,
-            submission_class_code = EXCLUDED.submission_class_code,
-            submission_class_code_description = EXCLUDED.submission_class_code_description,
-            submission_date = EXCLUDED.submission_date,
             products = EXCLUDED.products;
     """
 
-    logging.info(f"Upserting {len(rows)} rows into approvals...")
-    extras.execute_values(cur, query, rows)
-    conn.commit()
+    with conn.cursor() as cur:
+        extras.execute_values(cur, query, deduped, page_size=500)
+        conn.commit()
 
-    cur.close()
-    conn.close()
-    logging.info("FDA approvals upsert completed successfully!")
+    logger.info("FDA approvals upsert completed successfully!")
 
 
 # -----------------------------
