@@ -7,6 +7,7 @@ Fetches FDA drug approvals from openFDA API and upserts into database
 import os
 import requests
 import psycopg2
+from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 import logging
 from datetime import datetime, timedelta
@@ -21,16 +22,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# OpenFDA API base URL
 FDA_API_BASE = "https://api.fda.gov"
+url = f"{FDA_API_BASE}/drug/drugsfda.json"
 
 
 def fuzzy_match_drug(drug_name, conn):
-    """Try to match a drug name to the drugs table."""
+    """Fuzzy match drug name to existing drug"""
     with conn.cursor() as cur:
         cur.execute(
             """SELECT id FROM public.drugs
                WHERE LOWER(preferred_name) = LOWER(%s)
-                  OR LOWER(active_ingredient) = LOWER(%s)""",
+               OR LOWER(active_ingredient) = LOWER(%s)""",
             (drug_name, drug_name),
         )
         result = cur.fetchone()
@@ -40,7 +43,7 @@ def fuzzy_match_drug(drug_name, conn):
         cur.execute(
             """SELECT id FROM public.drugs
                WHERE LOWER(preferred_name) LIKE LOWER(%s)
-                  OR LOWER(active_ingredient) LIKE LOWER(%s)
+               OR LOWER(active_ingredient) LIKE LOWER(%s)
                LIMIT 1""",
             (f"%{drug_name}%", f"%{drug_name}%"),
         )
@@ -52,59 +55,52 @@ def fuzzy_match_drug(drug_name, conn):
 
 
 def fetch_approvals(max_pages=6, page_size=100):
-    """Fetch FDA approvals from openFDA (paged)."""
-    url = f"{FDA_API_BASE}/drug/drugsfda.json"
-    all_results = []
+    """Fetch FDA approvals (unfiltered)"""
+    logger.info("Fetching FDA approvals (bypassing date filter)...")
 
+    approvals = []
     for page in range(max_pages):
         params = {"limit": page_size, "skip": page * page_size}
         try:
             resp = requests.get(url, params=params, timeout=30)
-            if resp.status_code == 404:
-                break
             resp.raise_for_status()
-
             data = resp.json()
-            results = data.get("results", [])
-            if not results:
+            batch = data.get("results", [])
+            approvals.extend(batch)
+            logger.info(f"Fetched {len(batch)} approvals from page {page+1}")
+            if len(batch) < page_size:
                 break
-
-            logger.info(f"Fetched {len(results)} approvals from page {page+1}")
-            all_results.extend(results)
-
         except Exception as e:
-            logger.error(f"Error fetching page {page+1}: {e}")
+            logger.error(f"Error fetching FDA approvals: {e}")
             break
 
-    logger.info(f"Total {len(all_results)} FDA approvals fetched")
-    return all_results
+    logger.info(f"Total {len(approvals)} FDA approvals fetched")
+    return approvals
 
 
 def upsert_approvals(approvals, conn):
-    """Insert approvals into database (store raw drug name even if unmatched)."""
+    """Upsert approvals into database"""
     logger.info("Processing FDA approvals...")
-    processed = 0
 
     with conn.cursor() as cur:
+        processed = 0
+
         for approval in approvals:
             try:
                 openfda = approval.get("openfda", {})
                 brand_names = openfda.get("brand_name", [])
                 generic_names = openfda.get("generic_name", [])
 
-                drug_name = None
-                if brand_names:
-                    drug_name = brand_names[0]
-                elif generic_names:
-                    drug_name = generic_names[0]
-
+                drug_name = brand_names[0] if brand_names else (
+                    generic_names[0] if generic_names else None
+                )
                 if not drug_name:
                     continue
 
-                # Match to drugs table (may be None)
                 drug_id = fuzzy_match_drug(drug_name, conn)
+                if not drug_id:
+                    continue
 
-                # Process submissions
                 submissions = approval.get("submissions", [])
                 for submission in submissions:
                     sub_date = submission.get("submission_date")
@@ -118,10 +114,9 @@ def upsert_approvals(approvals, conn):
                     except ValueError:
                         continue
 
-                    # Keep application number, even without docs
                     application_number = approval.get("application_number", "")
 
-                    # If application_docs exist → use them, else insert anyway
+                    # Case A: has documents
                     application_docs = submission.get("application_docs", [])
                     if application_docs:
                         for doc in application_docs:
@@ -143,7 +138,7 @@ def upsert_approvals(approvals, conn):
                             )
                             processed += 1
                     else:
-                        # Insert even without docs
+                        # Case B: insert even without docs
                         cur.execute(
                             """
                             INSERT INTO public.approvals
@@ -161,10 +156,9 @@ def upsert_approvals(approvals, conn):
                             ),
                         )
                         processed += 1
-                            break
 
             except Exception as e:
-                logger.warning(f"Error processing record: {str(e)}")
+                logger.warning(f"Error processing approval record: {str(e)}")
                 continue
 
         conn.commit()
@@ -172,11 +166,13 @@ def upsert_approvals(approvals, conn):
 
 
 def main():
+    """Main ETL function"""
     try:
         conn = get_db_connection()
         logger.info("Connected to database")
 
         approvals = fetch_approvals(max_pages=6, page_size=100)
+
         if approvals:
             upsert_approvals(approvals, conn)
             logger.info("FDA approvals ETL completed successfully!")
