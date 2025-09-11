@@ -78,7 +78,23 @@ def fetch_fda_approvals(limit=100, max_skip=1000):
 
 
 def upsert_approvals(approvals, conn):
-    """Insert or update FDA approvals in DB"""
+    """Insert or update FDA approvals in DB (deduplicated first)"""
+    missing_brand = sum(1 for a in approvals if not a.get("brand_name"))
+    missing_generic = sum(1 for a in approvals if not a.get("generic_name"))
+
+    logger.info(f"Approvals missing brand_name: {missing_brand}")
+    logger.info(f"Approvals missing generic_name: {missing_generic}")
+
+    # Deduplicate on (application_number, submission_number)
+    deduped = {}
+    for a in approvals:
+        key = (a.get("application_number"), a.get("submission_number"))
+        if key not in deduped:  # keep first seen
+            deduped[key] = a
+
+    approvals = list(deduped.values())
+    logger.info(f"After deduplication: {len(approvals)} approvals remain")
+
     with conn.cursor() as cur:
         query = """
             INSERT INTO approvals (
