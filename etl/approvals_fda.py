@@ -65,18 +65,21 @@ def fetch_fda_approvals(limit=100, max_skip=1000):
                         document_url = docs[0].get("url")
 
                 # products
-                products = record.get("products", [])
-                for prod in products:
-                    route = prod.get("route")
-                    dosage_form = prod.get("dosage_form")
+               # products
+products = record.get("products", [])
+for prod in products:
+    route = prod.get("route")
+    dosage_form = prod.get("dosage_form")
 
-                    approvals.append((
-                        application_number, sponsor, brand_name, generic_name,
-                        submission_type, submission_number, submission_status,
-                        submission_status_date, review_priority,
-                        submission_class_code, submission_class_code_description,
-                        approval_date, agency, document_url, route, dosage_form, products
-                    ))
+    approvals.append((
+        application_number, sponsor, brand_name, generic_name,
+        submission_type, submission_number, submission_status,
+        submission_status_date, review_priority,
+        submission_class_code, submission_class_code_description,
+        approval_date, agency, document_url, route, dosage_form,
+        json.dumps(products)  # 🔑 FIXED
+    ))
+
 
         skip += limit
 
