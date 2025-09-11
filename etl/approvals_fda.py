@@ -1,106 +1,117 @@
 import os
-import logging
-import psycopg2
 import requests
+import logging
 from datetime import datetime, timedelta
+import psycopg2
+from psycopg2.extras import execute_values
 
-# --- Logging setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+FDA_API_URL = "https://api.fda.gov/drug/drugsfda.json"
+DAYS_BACK = 365
 
-def fetch_recent_approvals(days_back=365, max_pages=6, page_size=100):
-    """
-    Fetch FDA drug approvals from OpenFDA API and filter locally by submission_date.
-    """
-    cutoff_date = datetime.today() - timedelta(days=days_back)
-    cutoff_str = cutoff_date.strftime("%Y-%m-%d")
 
-    url = "https://api.fda.gov/drug/drugsfda.json"
+def get_fda_approvals():
+    approvals = []
+    skip = 0
+    limit = 100
+    cutoff_date = (datetime.utcnow() - timedelta(days=DAYS_BACK)).date()
 
-    all_results = []
-    for page in range(max_pages):
-        params = {"limit": page_size, "skip": page * page_size}
-        try:
-            resp = requests.get(url, params=params)
-            resp.raise_for_status()
-            results = resp.json().get("results", [])
-        except Exception as e:
-            logging.error(f"Error fetching FDA approvals: {e}")
+    logging.info("Fetching FDA approvals (using submission_status_date)...")
+
+    while True:
+        url = f"{FDA_API_URL}?limit={limit}&skip={skip}"
+        resp = requests.get(url)
+
+        if resp.status_code != 200:
+            logging.error(f"Error fetching FDA approvals: {resp.status_code} {resp.text}")
             break
 
+        data = resp.json()
+        results = data.get("results", [])
         if not results:
             break
 
-        logging.info(f"Fetched {len(results)} approvals from page {page+1}")
-        all_results.extend(results)
+        logging.info(f"Fetched {len(results)} approvals from page {skip // limit + 1}")
 
-    logging.info(f"Total {len(all_results)} FDA approvals fetched (unfiltered)")
+        for r in results:
+            application_number = r.get("application_number")
+            sponsor = r.get("sponsor_name")
+            products = r.get("products", [])
+            submissions = r.get("submissions", [])
 
-    # ✅ Local date filter
-    filtered = []
-    for entry in all_results:
-        subs = entry.get("submissions", [])
-        if not subs:
-            continue
-        try:
-            submission_date = subs[0].get("submission_date")
-            if submission_date and submission_date >= cutoff_str:
-                filtered.append(entry)
-        except Exception:
-            continue
+            for sub in submissions:
+                raw_date = sub.get("submission_status_date")
+                if not raw_date:
+                    continue
 
-    logging.info(f"Filtered down to {len(filtered)} approvals after {cutoff_str}")
+                try:
+                    submission_date = datetime.strptime(raw_date, "%Y%m%d").date()
+                except Exception:
+                    continue
 
-    # 🔎 Show samples for debugging
-    for sample in filtered[:5]:
-        app_num = sample.get("application_number")
-        sponsor = sample.get("sponsor_name")
-        subs = sample.get("submissions", [])
-        submission_date = subs[0].get("submission_date") if subs else None
-        logging.info(f"Sample approval → App#: {app_num}, Sponsor: {sponsor}, Date: {submission_date}")
+                # filter only recent approvals
+                if submission_date >= cutoff_date:
+                    approvals.append({
+                        "application_number": application_number,
+                        "sponsor": sponsor,
+                        "submission_type": sub.get("submission_type"),
+                        "submission_number": sub.get("submission_number"),
+                        "submission_status": sub.get("submission_status"),
+                        "submission_date": submission_date.isoformat(),
+                        "products": [p.get("brand_name") for p in products if "brand_name" in p]
+                    })
 
-    return filtered
+        skip += limit
+
+    logging.info(f"Total {len(approvals)} FDA approval records after filtering")
+    return approvals
 
 
-def upsert_approvals(records):
-    """
-    Upsert FDA approvals into database.
-    """
-    if not records:
-        logging.warning("No FDA approvals to insert")
+def upsert_approvals(approvals):
+    if not approvals:
+        logging.info("No approvals to process")
         return
 
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
-    for rec in records:
-        app_num = rec.get("application_number")
-        sponsor = rec.get("sponsor_name")
-        subs = rec.get("submissions", [])
-        submission_date = subs[0].get("submission_date") if subs else None
+    rows = [
+        (
+            a["application_number"],
+            a["sponsor"],
+            a["submission_type"],
+            a["submission_number"],
+            a["submission_status"],
+            a["submission_date"],
+            a["products"]
+        )
+        for a in approvals
+    ]
 
-        cur.execute("""
-            INSERT INTO approvals (application_number, sponsor_name, submission_date)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (application_number) DO UPDATE
-            SET sponsor_name = EXCLUDED.sponsor_name,
-                submission_date = EXCLUDED.submission_date
-        """, (app_num, sponsor, submission_date))
+    query = """
+        INSERT INTO public.approvals
+            (application_number, sponsor, submission_type, submission_number, submission_status, submission_date, products)
+        VALUES %s
+        ON CONFLICT (application_number, submission_number) DO UPDATE
+        SET sponsor = EXCLUDED.sponsor,
+            submission_type = EXCLUDED.submission_type,
+            submission_status = EXCLUDED.submission_status,
+            submission_date = EXCLUDED.submission_date,
+            products = EXCLUDED.products;
+    """
 
+    execute_values(cur, query, rows)
     conn.commit()
     cur.close()
     conn.close()
 
-    logging.info(f"Upserted {len(records)} FDA approvals")
-
-
-def main():
-    logging.info("Fetching FDA approvals...")
-    approvals = fetch_recent_approvals(days_back=365, max_pages=6, page_size=100)
-    upsert_approvals(approvals)
-    logging.info("FDA approvals ETL completed successfully!")
+    logging.info(f"Upserted {len(rows)} approvals into DB")
 
 
 if __name__ == "__main__":
-    main()
+    logging.info("Connected to database")
+    approvals = get_fda_approvals()
+    upsert_approvals(approvals)
+    logging.info("FDA approvals ETL completed successfully!")
