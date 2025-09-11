@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 FDA_API_BASE = "https://api.fda.gov"
 
 
-def fetch_fda_approvals(limit=100, max_skip=25000):
+def fetch_fda_approvals(limit=100, max_skip=1000):
     """
     Fetch FDA approvals using pagination (limit + skip).
     Stops at skip limit (25,000 due to FDA API restriction).
@@ -123,7 +123,7 @@ def main():
         conn = get_db_connection()
         logger.info("Connected to database")
 
-        approvals = fetch_fda_approvals(limit=100, max_skip=25000)
+        approvals = fetch_fda_approvals(limit=100, max_skip=1000)
 
         if approvals:
             upsert_approvals(approvals, conn)  # ✅ fixed: pass conn
