@@ -1,162 +1,115 @@
 import os
+import sys
 import requests
 import logging
-import psycopg2
 from datetime import datetime, timedelta
+import psycopg2
+from psycopg2.extras import execute_values
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# --- Logging setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stdout
+)
 
-FDA_URL = "https://api.fda.gov/drug/drugsfda.json"
-PAGE_SIZE = 100
-MAX_PAGES = 6
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# ---------------------------
-# Database connection
-# ---------------------------
+# --- DB connection helper ---
 def get_connection():
-    return psycopg2.connect(os.environ["DATABASE_URL"])
+    return psycopg2.connect(DATABASE_URL)
 
-# ---------------------------
-# Get or create drug
-# ---------------------------
-def get_or_create_drug(drug_name, conn):
-    """Return drug_id if exists, else insert new drug into public.drugs"""
-    with conn.cursor() as cur:
-        cur.execute(
-            """SELECT id FROM public.drugs
-               WHERE LOWER(preferred_name) = LOWER(%s)
-                  OR LOWER(active_ingredient) = LOWER(%s)""",
-            (drug_name, drug_name),
-        )
-        result = cur.fetchone()
-        if result:
-            return result[0]
 
-        # Insert new drug if not found
-        cur.execute(
-            """
-            INSERT INTO public.drugs (preferred_name, active_ingredient, mechanism, company_id, created_at)
-            VALUES (%s, %s, %s, NULL, NOW())
-            RETURNING id
-            """,
-            (drug_name, drug_name, None),
-        )
-        new_id = cur.fetchone()[0]
-        conn.commit()
-        logger.info(f"Inserted new drug into public.drugs: {drug_name} (id={new_id})")
-        return new_id
+# --- FDA Approvals fetch ---
+def fetch_recent_approvals(days_back=365, max_pages=6, page_size=100):
+    cutoff_date = datetime.today() - timedelta(days=days_back)
+    cutoff_str = cutoff_date.strftime("%Y-%m-%d")
 
-# ---------------------------
-# Fetch FDA approvals
-# ---------------------------
-def fetch_approvals(days_back=365, max_pages=6):
-    approvals = []
-    skip = 0
-    today = datetime.utcnow().date()
-    cutoff = today - timedelta(days=days_back)
+    url = "https://api.fda.gov/drug/drugsfda.json"
 
+    all_results = []
     for page in range(max_pages):
-        params = {"limit": PAGE_SIZE, "skip": skip}
+        params = {
+            "search": f"submissions.submission_date:[{cutoff_str}+TO+*]",
+            "limit": page_size,
+            "skip": page * page_size
+        }
+
         try:
-            resp = requests.get(FDA_URL, params=params)
+            resp = requests.get(url, params=params)
             resp.raise_for_status()
-            data = resp.json()
+            results = resp.json().get("results", [])
         except Exception as e:
-            logger.error(f"Error fetching FDA approvals: {e}")
+            logging.error(f"Error fetching FDA approvals: {e}")
             break
 
-        results = data.get("results", [])
         if not results:
+            logging.info(f"No more results after page {page+1}")
             break
 
-        logger.info(f"Fetched {len(results)} approvals from page {page+1}")
+        logging.info(f"Fetched {len(results)} approvals from page {page+1}")
+        all_results.extend(results)
 
-        for r in results:
-            submissions = r.get("submissions", [])
-            if not submissions:
-                continue
+    logging.info(f"Total {len(all_results)} FDA approvals fetched")
+    return all_results
 
-            # Take first submission (simplified assumption)
-            sub = submissions[0]
-            sub_date = sub.get("submission_date")
-            if not sub_date:
-                continue
 
-            try:
-                sub_date_dt = datetime.strptime(sub_date, "%Y%m%d").date()
-            except ValueError:
-                continue
+# --- Transform approvals into DB-ready rows ---
+def transform_approvals(results):
+    rows = []
+    for entry in results:
+        appl_no = entry.get("application_number")
+        sponsor = entry.get("sponsor_name")
+        product = entry.get("products", [{}])[0].get("brand_name")
+        submission_date = None
 
-            # Only take within window
-            if sub_date_dt < cutoff:
-                continue
+        subs = entry.get("submissions", [])
+        if subs:
+            submission_date = subs[0].get("submission_date")
 
-            appl_no = r.get("application_number")
-            products = r.get("products", [])
-            if not products:
-                continue
+        if appl_no and submission_date:
+            rows.append((
+                appl_no,
+                sponsor,
+                product,
+                submission_date
+            ))
 
-            drug_name = products[0].get("brand_name") or products[0].get("active_ingredients", [{}])[0].get("name")
+    logging.info(f"Prepared {len(rows)} rows for DB upsert")
+    return rows
 
-            if not drug_name:
-                continue
 
-            approvals.append({
-                "application_number": appl_no,
-                "drug_name": drug_name,
-                "submission_type": sub.get("submission_type"),
-                "submission_status": sub.get("submission_status"),
-                "submission_date": sub_date_dt
-            })
+# --- Load into DB ---
+def upsert_approvals(rows):
+    if not rows:
+        logging.warning("No FDA approvals to insert")
+        return
 
-        skip += PAGE_SIZE
+    insert_sql = """
+        INSERT INTO approvals (application_number, sponsor, product_name, submission_date)
+        VALUES %s
+        ON CONFLICT (application_number) DO UPDATE
+        SET sponsor = EXCLUDED.sponsor,
+            product_name = EXCLUDED.product_name,
+            submission_date = EXCLUDED.submission_date;
+    """
 
-    logger.info(f"Total {len(approvals)} FDA approval records after filtering")
-    return approvals
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            execute_values(cur, insert_sql, rows)
+        conn.commit()
 
-# ---------------------------
-# Upsert approvals
-# ---------------------------
-def upsert_approvals(approvals, conn):
-    with conn.cursor() as cur:
-        for a in approvals:
-            drug_id = get_or_create_drug(a["drug_name"], conn)
+    logging.info(f"Inserted/updated {len(rows)} FDA approvals into DB")
 
-            cur.execute(
-                """
-                INSERT INTO public.approvals (drug_id, source, approval_date, submission_type, status, created_at)
-                VALUES (%s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (drug_id, source, approval_date)
-                DO UPDATE SET status = EXCLUDED.status
-                """,
-                (
-                    drug_id,
-                    "FDA",
-                    a["submission_date"],
-                    a["submission_type"],
-                    a["submission_status"],
-                ),
-            )
-    conn.commit()
-    logger.info(f"Processed {len(approvals)} FDA approval records")
 
-# ---------------------------
-# Main
-# ---------------------------
+# --- Main ETL ---
 def main():
-    conn = get_connection()
-    logger.info("Connected to database")
+    logging.info("Connected to database")
+    approvals = fetch_recent_approvals(days_back=365)
+    rows = transform_approvals(approvals)
+    upsert_approvals(rows)
+    logging.info("FDA approvals ETL completed successfully!")
 
-    approvals = fetch_approvals(days_back=365, max_pages=MAX_PAGES)
-
-    if approvals:
-        upsert_approvals(approvals, conn)
-    else:
-        logger.info("No approvals to process")
-
-    conn.close()
-    logger.info("FDA approvals ETL completed successfully!")
 
 if __name__ == "__main__":
     main()
