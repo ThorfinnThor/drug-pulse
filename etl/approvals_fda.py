@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 FDA_API_BASE = "https://api.fda.gov"
 
 
-def fetch_fda_approvals(limit=100, max_skip=25000):
+def fetch_fda_approvals(limit=100, max_skip=1000):
     """Fetch FDA approvals with pagination and extract brand/generic names"""
     approvals = []
     skip = 0
@@ -122,7 +122,7 @@ def main():
         conn = get_db_connection()
         logger.info("Connected to database")
 
-        approvals = fetch_fda_approvals()
+        approvals = fetch_fda_approvals(limit=100, max_skip=1000)
 
         if approvals:
             upsert_approvals(approvals, conn)
