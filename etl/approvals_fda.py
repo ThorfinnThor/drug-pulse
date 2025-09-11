@@ -118,12 +118,13 @@ def upsert_approvals(approvals, conn):
                     except ValueError:
                         continue
 
-                    application_docs = submission.get("application_docs", [])
-                    for doc in application_docs:
-                        doc_url = doc.get("url", "")
-                        doc_type = doc.get("type", "")
+                    # Keep application number, even without docs
+                    application_number = approval.get("application_number", "")
 
-                        if "approval" in doc_type.lower():
+                    # If application_docs exist → use them, else insert anyway
+                    application_docs = submission.get("application_docs", [])
+                    if application_docs:
+                        for doc in application_docs:
                             cur.execute(
                                 """
                                 INSERT INTO public.approvals
@@ -136,11 +137,30 @@ def upsert_approvals(approvals, conn):
                                     approval_date,
                                     drug_id,
                                     drug_name,
-                                    doc_url,
-                                    approval.get("application_number", ""),
+                                    doc.get("url", ""),
+                                    application_number,
                                 ),
                             )
                             processed += 1
+                    else:
+                        # Insert even without docs
+                        cur.execute(
+                            """
+                            INSERT INTO public.approvals
+                            (agency, approval_date, drug_id, raw_drug_name, document_url, application_number, created_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (
+                                "FDA",
+                                approval_date,
+                                drug_id,
+                                drug_name,
+                                None,
+                                application_number,
+                            ),
+                        )
+                        processed += 1
                             break
 
             except Exception as e:
