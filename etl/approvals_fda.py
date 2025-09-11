@@ -1,69 +1,82 @@
+#!/usr/bin/env python3
+"""
+FDA Approvals ETL Script
+Fetches FDA drug approvals from openFDA API and upserts into database
+"""
 import os
 import requests
 import psycopg2
-import psycopg2.extras as extras
-import json
-import logging
-from datetime import datetime, timedelta
-
 from psycopg2 import extras
-logger = logging.getLogger(__name__)
+from dotenv import load_dotenv
+import logging
+from datetime import datetime
+
+from db import get_db_connection
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-FDA_ENDPOINT = "https://api.fda.gov/drug/drugsfda.json"
+FDA_API_BASE = "https://api.fda.gov"
 
-# -----------------------------
-# Fetch FDA approvals
-# -----------------------------
-def fetch_fda_approvals(limit=100, max_skip=1000):
+
+def fetch_fda_approvals(limit=100, max_skip=25000):
+    """
+    Fetch FDA approvals using pagination (limit + skip).
+    Stops at skip limit (25,000 due to FDA API restriction).
+    """
     approvals = []
     skip = 0
 
-    logging.info("Fetching FDA approvals...")
+    while skip <= max_skip:
+        params = {"limit": limit, "skip": skip}
+        url = f"{FDA_API_BASE}/drug/drugsfda.json"
 
-    while True:
-        url = f"{FDA_ENDPOINT}?limit={limit}&skip={skip}"
-        logging.info(f"Fetching {url}")
-        resp = requests.get(url)
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            if resp.status_code == 404:
+                logger.info("No more FDA approvals found.")
+                break
+            resp.raise_for_status()
 
-        if resp.status_code != 200:
-            logging.error(f"Error fetching FDA approvals: {resp.status_code} {resp.text}")
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                break
+
+            approvals.extend(results)
+            logger.info(f"Fetched {len(results)} approvals from page skip={skip}")
+
+            skip += limit
+            if skip > max_skip:
+                logger.warning("Reached FDA API skip limit (25,000). Stopping pagination.")
+                break
+
+        except Exception as e:
+            logger.error(f"Error fetching FDA approvals: {e}")
             break
 
-        data = resp.json()
-        results = data.get("results", [])
-
-        if not results:
-            break
-
-        approvals.extend(results)
-        logging.info(f"Fetched {len(results)} approvals from page skip={skip}")
-
-        skip += limit
-        if skip >= max_skip:
-            logging.warning("Reached FDA API skip limit (25,000). Stopping pagination.")
-            break
-
-    logging.info(f"Total {len(approvals)} FDA approvals fetched")
+    logger.info(f"Total {len(approvals)} FDA approvals fetched")
     return approvals
 
 
-# -----------------------------
-# Upsert approvals into DB
-# -----------------------------
 def upsert_approvals(approvals, conn):
-    """Upsert approvals into database with deduplication"""
-    logger.info("Processing FDA approvals...")
+    """
+    Upsert FDA approvals into the approvals table.
+    Deduplicates by (application_number, submission_number).
+    """
+    logger.info(f"Upserting {len(approvals)} approvals into DB...")
 
     rows = []
     for app in approvals:
-        submissions = app.get("submissions", [])
-        for sub in submissions:
+        app_num = app.get("application_number", "")
+        sponsor = app.get("sponsor_name", "")
+
+        for sub in app.get("submissions", []):
             rows.append((
-                app.get("application_number"),
-                app.get("sponsor_name"),
+                app_num,
+                sponsor,
                 sub.get("submission_type"),
                 sub.get("submission_number"),
                 sub.get("submission_status"),
@@ -72,19 +85,15 @@ def upsert_approvals(approvals, conn):
                 sub.get("submission_class_code"),
                 sub.get("submission_class_code_description"),
                 sub.get("submission_date"),
-                app.get("products")
+                psycopg2.extras.Json(app.get("products", []))  # ✅ store as JSONB
             ))
 
-    # ✅ Deduplicate rows by (application_number, submission_number)
-    seen = set()
-    deduped = []
-    for row in rows:
-        key = (row[0], row[3])  # (application_number, submission_number)
-        if key not in seen:
-            deduped.append(row)
-            seen.add(key)
+    if not rows:
+        logger.info("No submission rows to insert.")
+        return
 
-    logger.info(f"Upserting {len(deduped)} unique rows into approvals...")
+    # Deduplicate before inserting
+    rows = list({(r[0], r[3]): r for r in rows}.values())
 
     query = """
         INSERT INTO approvals (
@@ -104,16 +113,31 @@ def upsert_approvals(approvals, conn):
     """
 
     with conn.cursor() as cur:
-        extras.execute_values(cur, query, deduped, page_size=500)
-        conn.commit()
+        extras.execute_values(cur, query, rows)
+    conn.commit()
+    logger.info(f"Inserted/updated {len(rows)} approvals")
 
-    logger.info("FDA approvals upsert completed successfully!")
+
+def main():
+    try:
+        conn = get_db_connection()
+        logger.info("Connected to database")
+
+        approvals = fetch_fda_approvals(limit=100, max_skip=25000)
+
+        if approvals:
+            upsert_approvals(approvals, conn)  # ✅ fixed: pass conn
+            logger.info("FDA approvals ETL completed successfully!")
+        else:
+            logger.info("No approvals to process")
+
+    except Exception as e:
+        logger.error(f"ETL failed: {e}")
+        raise
+    finally:
+        if "conn" in locals():
+            conn.close()
 
 
-# -----------------------------
-# Main
-# -----------------------------
 if __name__ == "__main__":
-    logging.info("Connected to database")
-    approvals = fetch_fda_approvals(limit=100, max_skip=1000)
-    upsert_approvals(approvals)
+    main()
