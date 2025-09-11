@@ -113,5 +113,5 @@ def upsert_approvals(approvals):
 # -----------------------------
 if __name__ == "__main__":
     logging.info("Connected to database")
-    approvals = fetch_fda_approvals(limit=100, max_skip=25000)
+    approvals = fetch_fda_approvals(limit=100, max_skip=1000)
     upsert_approvals(approvals)
