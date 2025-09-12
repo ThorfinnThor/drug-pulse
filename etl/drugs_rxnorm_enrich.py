@@ -4,9 +4,11 @@ drugs_rxnorm_enrich.py
 ----------------------
 Enrich drugs with ingredient, tradename, and synonyms using RxNorm.
 - Try allRelated.json
-- If 404 or empty, fallback to related.json
-- If still empty, fallback to properties.json
-Logs which source was used.
+- If empty → try related.json
+- If still missing ingredient → explicitly query /related.json?tty=IN
+- If all fail → fallback to properties.json
+Writes updates in batches to avoid SSL EOF issues.
+Prints a summary at the end of the run.
 """
 
 import os
@@ -15,11 +17,16 @@ import logging
 import psycopg2
 from psycopg2 import extras
 import requests
+from collections import Counter
 
+# -------------------------
+# Config
+# -------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 RXNAV_BASE = "https://rxnav.nlm.nih.gov/REST"
-LIMIT = int(os.getenv("RXNORM_ENRICH_LIMIT", "1000"))
+LIMIT = int(os.getenv("RXNORM_ENRICH_LIMIT", "100"))
 SLEEP_BETWEEN_CALLS = float(os.getenv("RXNORM_SLEEP", "0.1"))
+BATCH_SIZE = int(os.getenv("RXNORM_BATCH_SIZE", "200"))
 SYN_TTYS = {"BN", "SBD", "SCD", "IN", "PIN", "MIN"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -49,9 +56,12 @@ def select_rows_to_enrich(conn, limit):
         return cur.fetchall()
 
 
-def upsert_enrichments(conn, rows):
+def upsert_enrichments(conn, rows, batch_size=BATCH_SIZE):
+    """Upsert enrichment data in smaller batches to avoid SSL EOF issues."""
     if not rows:
+        logger.info("No enrichment updates to write.")
         return
+
     query = """
         UPDATE drugs AS d
         SET
@@ -61,10 +71,13 @@ def upsert_enrichments(conn, rows):
         FROM (VALUES %s) AS data(id, ingredient, tradename, synonyms)
         WHERE d.id = data.id::int
     """
+
     with conn.cursor() as cur:
-        extras.execute_values(cur, query, rows, page_size=500)
+        for i in range(0, len(rows), batch_size):
+            chunk = rows[i:i + batch_size]
+            extras.execute_values(cur, query, chunk, page_size=batch_size)
     conn.commit()
-    logger.info("✅ Updated %d drugs with ingredient/tradename/synonyms", len(rows))
+    logger.info("✅ Updated %d drugs with ingredient/tradename/synonyms (in batches of %d)", len(rows), batch_size)
 
 
 # -------------------------
@@ -105,35 +118,57 @@ def parse_concepts(concept_groups):
     return ingredient, tradename, syn_str
 
 
-def enrich_one_rxcui(rxcui):
+def fallback_to_ingredient(rxcui: str):
+    """Explicitly query ingredient if not found in normal enrichment."""
+    url = f"{RXNAV_BASE}/rxcui/{rxcui}/related.json?tty=IN"
+    data = http_get_json(url)
+    if data and "relatedGroup" in data:
+        groups = data["relatedGroup"].get("conceptGroup", [])
+        ing, _, _ = parse_concepts(groups)
+        if ing:
+            logger.info("Resolved ingredient for RxCUI %s via related.json?tty=IN", rxcui)
+            return ing
+    return None
+
+
+def enrich_one_rxcui(rxcui, stats: Counter):
     # 1) Try allRelated.json
-    url1 = f"{RXNAV_BASE}/rxcui/{rxcui}/allRelated.json"
-    data = http_get_json(url1)
+    data = http_get_json(f"{RXNAV_BASE}/rxcui/{rxcui}/allRelated.json")
     if data and "allRelatedGroup" in data:
         groups = data["allRelatedGroup"].get("conceptGroup", [])
         if groups:
-            logger.info("Enriched RxCUI %s via allRelated.json", rxcui)
-            return parse_concepts(groups)
+            ing, bn, syn = parse_concepts(groups)
+            if not ing:
+                ing = fallback_to_ingredient(rxcui)
+                if ing:
+                    stats["ingredient_fallback"] += 1
+            if any([ing, bn, syn]):
+                stats["allRelated"] += 1
+                return ing, bn, syn
 
-    # 2) Fallback: related.json with specific TTYS
-    url2 = f"{RXNAV_BASE}/rxcui/{rxcui}/related.json?tty=IN+BN+SCD+SBD"
-    data = http_get_json(url2)
+    # 2) Fallback: related.json
+    data = http_get_json(f"{RXNAV_BASE}/rxcui/{rxcui}/related.json?tty=IN+BN+SCD+SBD")
     if data and "relatedGroup" in data:
         groups = data["relatedGroup"].get("conceptGroup", [])
         if groups:
-            logger.info("Enriched RxCUI %s via related.json", rxcui)
-            return parse_concepts(groups)
+            ing, bn, syn = parse_concepts(groups)
+            if not ing:
+                ing = fallback_to_ingredient(rxcui)
+                if ing:
+                    stats["ingredient_fallback"] += 1
+            if any([ing, bn, syn]):
+                stats["related"] += 1
+                return ing, bn, syn
 
     # 3) Fallback: properties.json
-    url3 = f"{RXNAV_BASE}/rxcui/{rxcui}/properties.json"
-    data = http_get_json(url3)
+    data = http_get_json(f"{RXNAV_BASE}/rxcui/{rxcui}/properties.json")
     if data and "properties" in data:
         name = data["properties"].get("name")
         if name:
-            logger.info("Enriched RxCUI %s via properties.json", rxcui)
+            stats["properties"] += 1
             return None, None, name
 
-    logger.warning("No enrichment data for RxCUI %s", rxcui)
+    stats["none"] += 1
     return None, None, None
 
 
@@ -142,18 +177,28 @@ def enrich_one_rxcui(rxcui):
 # -------------------------
 def main():
     conn = get_db_connection()
+    stats = Counter()
+
     try:
         targets = select_rows_to_enrich(conn, LIMIT)
         logger.info("Found %d drugs to enrich", len(targets))
 
         enriched = []
         for (drug_id, rxcui) in targets:
-            ing, bn, syn = enrich_one_rxcui(str(rxcui))
+            ing, bn, syn = enrich_one_rxcui(str(rxcui), stats)
             if any([ing, bn, syn]):
                 enriched.append((drug_id, ing, bn, syn))
             time.sleep(SLEEP_BETWEEN_CALLS)
 
-        upsert_enrichments(conn, enriched)
+        upsert_enrichments(conn, enriched, batch_size=BATCH_SIZE)
+
+        # --- Summary report ---
+        logger.info("=== Enrichment Summary ===")
+        logger.info("allRelated.json        : %d", stats["allRelated"])
+        logger.info("related.json           : %d", stats["related"])
+        logger.info("ingredient_fallback    : %d", stats["ingredient_fallback"])
+        logger.info("properties.json        : %d", stats["properties"])
+        logger.info("no data                : %d", stats["none"])
 
     finally:
         conn.close()
