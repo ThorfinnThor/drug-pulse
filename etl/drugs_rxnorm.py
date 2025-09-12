@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 RXNAV_BASE = "https://rxnav.nlm.nih.gov/REST"
-LIMIT = int(os.getenv("RXNORM_LIMIT", "100"))      # number of rows to attempt per run
+LIMIT = int(os.getenv("RXNORM_LIMIT", "1000"))      # number of rows to attempt per run
 HTTP_TIMEOUT = float(os.getenv("RXNORM_HTTP_TIMEOUT", "12"))
 SLEEP = float(os.getenv("RXNORM_SLEEP", "0.10"))    # polite delay between HTTP calls
 
