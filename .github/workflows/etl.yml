@@ -62,7 +62,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
-      - name: Run FDA Drugs ETL
+      - name: Run Drugs RXnorm
         run: |
           cd etl
           python drugs_rxnorm.py
