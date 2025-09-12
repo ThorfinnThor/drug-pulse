@@ -68,6 +68,15 @@ jobs:
           python drugs_rxnorm.py
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+
+      - name: Run Drugs RXnorm Enrich
+        run: |
+          cd etl
+          python drugs_rxnorm_enrich.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
   
 
       - name: Refresh search materialized view
