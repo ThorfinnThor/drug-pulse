@@ -2,6 +2,7 @@ import os
 import requests
 import psycopg2
 import pandas as pd
+from bs4 import BeautifulSoup
 from io import BytesIO
 from psycopg2 import extras
 from dotenv import load_dotenv
@@ -10,26 +11,49 @@ from dotenv import load_dotenv
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Multiple Orange Book product URLs (FDA sometimes rotates these IDs)
-ORANGEBOOK_URLS = [
-    "https://www.fda.gov/media/76860/download",  # Older Products file
-    "https://www.fda.gov/media/76862/download",  # Alternate Products file
-]
+FDA_ORANGEBOOK_PAGE = "https://www.fda.gov/drugs/drug-approvals-and-databases/orange-book-data-files"
+
+def get_orangebook_url():
+    """
+    Scrape FDA Orange Book data page to find the current Products XLSX file.
+    """
+    print(f"Scraping {FDA_ORANGEBOOK_PAGE} for Orange Book files...")
+    resp = requests.get(FDA_ORANGEBOOK_PAGE, timeout=30)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Look for links to Excel/ZIP files that contain 'product' in name
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if ("product" in href.lower()) and (href.endswith(".zip") or href.endswith(".xlsx") or href.endswith(".xls")):
+            if href.startswith("/"):
+                href = "https://www.fda.gov" + href
+            print(f"✅ Found Orange Book file: {href}")
+            return href
+
+    raise RuntimeError("Could not find Orange Book Products file on FDA site")
 
 def fetch_orangebook_products():
     """
-    Try multiple Orange Book URLs until one works.
-    Returns a Pandas DataFrame.
+    Download and load the Orange Book products file into a DataFrame.
     """
-    for url in ORANGEBOOK_URLS:
-        print(f"Trying Orange Book products file from {url} ...")
-        resp = requests.get(url)
-        if resp.status_code == 200:
-            print(f"✅ Successfully fetched Orange Book products from {url}")
-            return pd.read_excel(BytesIO(resp.content))
-        else:
-            print(f"⚠️ Failed to fetch {url} with {resp.status_code}")
-    raise RuntimeError("No valid Orange Book file could be fetched.")
+    url = get_orangebook_url()
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+
+    if url.endswith(".zip"):
+        from zipfile import ZipFile
+        from io import BytesIO
+        zf = ZipFile(BytesIO(resp.content))
+        # assume first file inside ZIP is the Excel
+        fname = zf.namelist()[0]
+        df = pd.read_excel(zf.open(fname))
+    else:
+        df = pd.read_excel(BytesIO(resp.content))
+
+    print(f"✅ Orange Book data: {len(df)} rows loaded from {url}")
+    return df
 
 def upsert_orangebook(df, conn):
     """
@@ -54,7 +78,7 @@ def upsert_orangebook(df, conn):
         for _, row in df.iterrows():
             rows.append((
                 row.get("Ingredient", None),       # generic name
-                row.get("Ingredient", None),       # generic name
+                row.get("Ingredient", None),
                 row.get("Trade_Name", None),       # brand name
                 row.get("Applicant", None),        # manufacturer
                 row.get("Product_No", None),       # product ID
@@ -68,8 +92,6 @@ def upsert_orangebook(df, conn):
 def main():
     print("Fetching Orange Book products...")
     df = fetch_orangebook_products()
-    print(f"✅ Orange Book data: {len(df)} rows fetched")
-
     conn = psycopg2.connect(DATABASE_URL)
     try:
         upsert_orangebook(df, conn)
