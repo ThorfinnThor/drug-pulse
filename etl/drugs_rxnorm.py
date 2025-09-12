@@ -50,7 +50,7 @@ def fetch_drugs_without_rxnorm(conn, limit=LIMIT):
 
 
 def upsert_rxnorm_data(conn, rows):
-    """Bulk update drugs with RxNorm data"""
+    """Bulk update drugs with RxNorm data (without overwriting preferred_name)"""
     if not rows:
         return
 
@@ -61,9 +61,8 @@ def upsert_rxnorm_data(conn, rows):
             rxcui = data.rxcui,
             brand_name = COALESCE(data.brand_name, d.brand_name),
             generic_name = COALESCE(data.generic_name, d.generic_name),
-            preferred_name = COALESCE(data.preferred_name, d.preferred_name),
             synonyms = COALESCE(data.synonyms, d.synonyms)
-        FROM (VALUES %s) AS data(id, rxcui, brand_name, generic_name, preferred_name, synonyms)
+        FROM (VALUES %s) AS data(id, rxcui, brand_name, generic_name, synonyms)
         WHERE d.id = data.id::int
         """
         values = [
@@ -72,15 +71,13 @@ def upsert_rxnorm_data(conn, rows):
                 d.get("rxcui"),
                 d.get("brand_name"),
                 d.get("generic_name"),
-                d.get("preferred_name"),
                 d.get("synonyms"),
             )
             for d in rows
         ]
         extras.execute_values(cur, query, values)
     conn.commit()
-    logger.info(f"✅ Updated {len(rows)} drugs with RxNorm/FDA data")
-
+    logger.info(f"✅ Updated {len(rows)} drugs with RxNorm/FDA data (preferred_name unchanged)")
 
 # =========================
 # RxNorm API Helpers
