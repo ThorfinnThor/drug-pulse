@@ -3,9 +3,10 @@
 drugs_rxnorm_enrich.py
 ----------------------
 Enrich drugs with ingredient, tradename, and synonyms using RxNorm.
-- First try allRelated.json
+- Try allRelated.json
 - If 404 or empty, fallback to related.json
-- As last resort, use properties.json
+- If still empty, fallback to properties.json
+Logs which source was used.
 """
 
 import os
@@ -74,6 +75,8 @@ def http_get_json(url: str):
         resp = requests.get(url, timeout=12, headers={"User-Agent": "pharmaintel/1.0"})
         if resp.status_code == 200:
             return resp.json()
+        if resp.status_code == 404:
+            return None
         logger.warning("RxNav non-200 (%s) for %s", resp.status_code, url)
     except requests.RequestException as e:
         logger.warning("RxNav request failed (%s) for %s", e, url)
@@ -104,26 +107,33 @@ def parse_concepts(concept_groups):
 
 def enrich_one_rxcui(rxcui):
     # 1) Try allRelated.json
-    data = http_get_json(f"{RXNAV_BASE}/rxcui/{rxcui}/allRelated.json")
+    url1 = f"{RXNAV_BASE}/rxcui/{rxcui}/allRelated.json"
+    data = http_get_json(url1)
     if data and "allRelatedGroup" in data:
         groups = data["allRelatedGroup"].get("conceptGroup", [])
         if groups:
+            logger.info("Enriched RxCUI %s via allRelated.json", rxcui)
             return parse_concepts(groups)
 
     # 2) Fallback: related.json with specific TTYS
-    data = http_get_json(f"{RXNAV_BASE}/rxcui/{rxcui}/related.json?tty=IN+BN+SCD+SBD")
+    url2 = f"{RXNAV_BASE}/rxcui/{rxcui}/related.json?tty=IN+BN+SCD+SBD"
+    data = http_get_json(url2)
     if data and "relatedGroup" in data:
         groups = data["relatedGroup"].get("conceptGroup", [])
         if groups:
+            logger.info("Enriched RxCUI %s via related.json", rxcui)
             return parse_concepts(groups)
 
-    # 3) Fallback: properties.json (just get preferred name as synonym)
-    data = http_get_json(f"{RXNAV_BASE}/rxcui/{rxcui}/properties.json")
+    # 3) Fallback: properties.json
+    url3 = f"{RXNAV_BASE}/rxcui/{rxcui}/properties.json"
+    data = http_get_json(url3)
     if data and "properties" in data:
         name = data["properties"].get("name")
         if name:
+            logger.info("Enriched RxCUI %s via properties.json", rxcui)
             return None, None, name
 
+    logger.warning("No enrichment data for RxCUI %s", rxcui)
     return None, None, None
 
 
