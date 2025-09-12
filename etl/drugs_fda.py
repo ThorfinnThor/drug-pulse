@@ -10,7 +10,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 FDA_NDC_API = "https://api.fda.gov/drug/ndc.json"
 
-def fetch_fda_drugs(limit=1000, max_skip=25000):
+def fetch_fda_drugs(limit=1000, max_skip=1000):
     """
     Fetch drug data from the FDA NDC API with pagination up to skip limit.
     """
