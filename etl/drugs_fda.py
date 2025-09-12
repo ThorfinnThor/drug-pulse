@@ -10,7 +10,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 FDA_NDC_API = "https://api.fda.gov/drug/ndc.json"
 
-def fetch_fda_drugs(limit=1000, max_skip=1000):
+def fetch_fda_drugs(limit=1000, max_skip=25000):
     """
     Fetch drug data from the FDA NDC API with pagination up to skip limit.
     """
@@ -33,23 +33,20 @@ def fetch_fda_drugs(limit=1000, max_skip=1000):
             openfda = r.get("openfda", {})
 
             drugs.append({
-                "preferred_name": (openfda.get("brand_name") or openfda.get("generic_name") or ["UNKNOWN"])[0],
-                "generic_name": (openfda.get("generic_name") or [None])[0],
-                "brand_name": (openfda.get("brand_name") or [None])[0],
-                "manufacturer_name": (openfda.get("manufacturer_name") or [None])[0],
                 "product_ndc": r.get("product_ndc"),
-                "package_ndc": (r.get("package_ndc") or [None])[0] if isinstance(r.get("package_ndc"), list) else r.get("package_ndc"),
-                "route": (openfda.get("route") or [None])[0],
+                "proprietary_name": (openfda.get("brand_name") or [None])[0],
+                "generic_name": (openfda.get("generic_name") or [None])[0],
+                "manufacturer_name": (openfda.get("manufacturer_name") or [None])[0],
+                "substance_name": openfda.get("substance_name"),
+                "route": openfda.get("route"),
                 "dosage_form": (openfda.get("dosage_form") or [None])[0],
-                "pharm_class": (openfda.get("pharm_class_epc") or [None])[0],
-                "product_type": r.get("product_type"),
-                "dea_schedule": r.get("dea_schedule"),
-                "substance_name": (openfda.get("substance_name") or [None])[0],
-                "unii": (openfda.get("unii") or [None])[0],
-                "rxcui": (openfda.get("rxcui") or [None])[0],
-                "marketing_status": r.get("marketing_status"),
-                "start_marketing_date": r.get("start_marketing_date"),
-                "end_marketing_date": r.get("end_marketing_date")
+                "pharm_class_epc": openfda.get("pharm_class_epc"),
+                "pharm_class_moa": openfda.get("pharm_class_moa"),
+                "unii": openfda.get("unii"),
+                "rxcui": openfda.get("rxcui"),
+                "spl_set_id": (openfda.get("spl_set_id") or [None])[0],
+                "spl_id": (openfda.get("spl_id") or [None])[0],
+                "marketing_status": r.get("marketing_status")
             })
 
         skip += limit
@@ -59,58 +56,62 @@ def fetch_fda_drugs(limit=1000, max_skip=1000):
 
 def deduplicate_drugs(drugs):
     """
-    Deduplicate drugs by preferred_name + product_ndc.
+    Deduplicate drugs by product_ndc (FDA’s stable key).
     """
     seen = {}
     for d in drugs:
-        key = (d["preferred_name"], d["product_ndc"])
-        if key not in seen:
+        key = d["product_ndc"]
+        if key and key not in seen:
             seen[key] = d
     print(f"✅ {len(seen)} unique drugs after deduplication")
     return list(seen.values())
 
 def upsert_drugs(drugs, conn):
-    """
-    Upsert drug records into the drugs table.
-    """
     with conn.cursor() as cur:
         query = """
-            INSERT INTO drugs (
-                preferred_name, generic_name, brand_name, manufacturer_name,
-                product_ndc, package_ndc, route, dosage_form,
-                pharm_class, product_type, dea_schedule,
-                substance_name, unii, rxcui,
-                marketing_status, start_marketing_date, end_marketing_date
-            )
-            VALUES %s
-            ON CONFLICT (preferred_name)
-            DO UPDATE SET
-                generic_name = EXCLUDED.generic_name,
-                brand_name = EXCLUDED.brand_name,
-                manufacturer_name = EXCLUDED.manufacturer_name,
-                route = EXCLUDED.route,
-                dosage_form = EXCLUDED.dosage_form,
-                pharm_class = EXCLUDED.pharm_class,
-                product_type = EXCLUDED.product_type,
-                dea_schedule = EXCLUDED.dea_schedule,
-                marketing_status = EXCLUDED.marketing_status,
-                start_marketing_date = EXCLUDED.start_marketing_date,
-                end_marketing_date = EXCLUDED.end_marketing_date;
+        INSERT INTO drugs (
+            product_ndc, proprietary_name, generic_name, manufacturer_name,
+            substance_name, route, dosage_form,
+            pharm_class_epc, pharm_class_moa, unii, rxcui,
+            spl_set_id, spl_id, marketing_status
+        )
+        VALUES %s
+        ON CONFLICT (product_ndc) DO UPDATE SET
+            proprietary_name = EXCLUDED.proprietary_name,
+            generic_name = EXCLUDED.generic_name,
+            manufacturer_name = EXCLUDED.manufacturer_name,
+            substance_name = EXCLUDED.substance_name,
+            route = EXCLUDED.route,
+            dosage_form = EXCLUDED.dosage_form,
+            pharm_class_epc = EXCLUDED.pharm_class_epc,
+            pharm_class_moa = EXCLUDED.pharm_class_moa,
+            unii = EXCLUDED.unii,
+            rxcui = EXCLUDED.rxcui,
+            spl_set_id = EXCLUDED.spl_set_id,
+            spl_id = EXCLUDED.spl_id,
+            marketing_status = EXCLUDED.marketing_status;
         """
         rows = [
             (
-                d["preferred_name"], d["generic_name"], d["brand_name"], d["manufacturer_name"],
-                d["product_ndc"], d["package_ndc"], d["route"], d["dosage_form"],
-                d["pharm_class"], d["product_type"], d["dea_schedule"],
-                d["substance_name"], d["unii"], d["rxcui"],
-                d["marketing_status"], d["start_marketing_date"], d["end_marketing_date"]
+                d.get("product_ndc"),
+                d.get("proprietary_name"),
+                d.get("generic_name"),
+                d.get("manufacturer_name"),
+                d.get("substance_name"),
+                d.get("route"),
+                d.get("dosage_form"),
+                d.get("pharm_class_epc"),
+                d.get("pharm_class_moa"),
+                d.get("unii"),
+                d.get("rxcui"),
+                d.get("spl_set_id"),
+                d.get("spl_id"),
+                d.get("marketing_status")
             )
-            for d in drugs
+            for d in drugs if d.get("product_ndc")
         ]
-
         extras.execute_values(cur, query, rows)
-        conn.commit()
-    print(f"✅ Upserted {len(drugs)} drugs into DB")
+    conn.commit()
 
 def main():
     conn = psycopg2.connect(DATABASE_URL)
