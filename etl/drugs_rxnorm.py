@@ -61,21 +61,25 @@ def fetch_targets(conn, limit: int) -> List[dict]:
         return cur.fetchall()
 
 
-def update_rxnorm_ids(conn, rows: List[Tuple[int, str]]) -> None:
-    """Bulk set rxnorm_id for the given (id, rxnorm_id) tuples."""
+def update_rxnorm_ids(conn, rows, batch_size=200):
+    """Bulk set rxnorm_id for the given (id, rxnorm_id) tuples in smaller batches."""
     if not rows:
         log.info("Nothing to update.")
         return
+
+    query = """
+        UPDATE drugs AS d
+        SET rxnorm_id = data.rxnorm_id
+        FROM (VALUES %s) AS data(id, rxnorm_id)
+        WHERE d.id = data.id::int
+    """
+
     with conn.cursor() as cur:
-        query = """
-            UPDATE drugs AS d
-            SET rxnorm_id = data.rxnorm_id
-            FROM (VALUES %s) AS data(id, rxnorm_id)
-            WHERE d.id = data.id::int
-        """
-        extras.execute_values(cur, query, rows, page_size=500)
+        for i in range(0, len(rows), batch_size):
+            chunk = rows[i:i+batch_size]
+            extras.execute_values(cur, query, chunk, page_size=batch_size)
     conn.commit()
-    log.info("✅ Set rxnorm_id for %d rows", len(rows))
+    log.info("✅ Set rxnorm_id for %d rows (in batches of %d)", len(rows), batch_size)
 
 
 # -------------------------
