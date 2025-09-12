@@ -18,15 +18,25 @@ def get_orangebook_url():
     Scrape FDA Orange Book data page to find the current Products XLSX file.
     """
     print(f"Scraping {FDA_ORANGEBOOK_PAGE} for Orange Book files...")
-    resp = requests.get(FDA_ORANGEBOOK_PAGE, timeout=30)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/116.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+
+    resp = requests.get(FDA_ORANGEBOOK_PAGE, headers=headers, timeout=30)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Look for links to Excel/ZIP files that contain 'product' in name
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if ("product" in href.lower()) and (href.endswith(".zip") or href.endswith(".xlsx") or href.endswith(".xls")):
+        if ("product" in href.lower()) and (
+            href.endswith(".zip") or href.endswith(".xlsx") or href.endswith(".xls")
+        ):
             if href.startswith("/"):
                 href = "https://www.fda.gov" + href
             print(f"✅ Found Orange Book file: {href}")
