@@ -18,7 +18,7 @@ import requests
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 RXNAV_BASE = "https://rxnav.nlm.nih.gov/REST"
-LIMIT = int(os.getenv("RXNORM_ENRICH_LIMIT", "100"))
+LIMIT = int(os.getenv("RXNORM_ENRICH_LIMIT", "1000"))
 SLEEP_BETWEEN_CALLS = float(os.getenv("RXNORM_SLEEP", "0.1"))
 SYN_TTYS = {"BN", "SBD", "SCD", "IN", "PIN", "MIN"}
 
