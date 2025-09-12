@@ -37,16 +37,21 @@ def fetch_fda_drugs(limit=1000, max_skip=25000):
                 "proprietary_name": (openfda.get("brand_name") or [None])[0],
                 "generic_name": (openfda.get("generic_name") or [None])[0],
                 "manufacturer_name": (openfda.get("manufacturer_name") or [None])[0],
-                "substance_name": openfda.get("substance_name"),
-                "route": openfda.get("route"),
+
+                # Arrays
+                "substance_name": openfda.get("substance_name", []),
+                "route": openfda.get("route", []),
                 "dosage_form": (openfda.get("dosage_form") or [None])[0],
-                "pharm_class_epc": openfda.get("pharm_class_epc"),
-                "pharm_class_moa": openfda.get("pharm_class_moa"),
-                "unii": openfda.get("unii"),
-                "rxcui": openfda.get("rxcui"),
-                "spl_set_id": (openfda.get("spl_set_id") or [None])[0],
-                "spl_id": (openfda.get("spl_id") or [None])[0],
-                "marketing_status": r.get("marketing_status")
+                "pharm_class_epc": openfda.get("pharm_class_epc", []),
+                "pharm_class_moa": openfda.get("pharm_class_moa", []),
+
+                "unii": openfda.get("unii", []),
+                "rxcui": openfda.get("rxcui", []),
+
+                # Labels / metadata
+                "spl_set_id": r.get("spl_set_id"),
+                "spl_id": r.get("spl_id"),
+                "marketing_status": r.get("marketing_status"),
             })
 
         skip += limit
@@ -54,9 +59,10 @@ def fetch_fda_drugs(limit=1000, max_skip=25000):
     print(f"✅ Fetched {len(drugs)} drugs from FDA NDC API")
     return drugs
 
+
 def deduplicate_drugs(drugs):
     """
-    Deduplicate drugs by product_ndc (FDA’s stable key).
+    Deduplicate drugs by product_ndc.
     """
     seen = {}
     for d in drugs:
@@ -65,6 +71,7 @@ def deduplicate_drugs(drugs):
             seen[key] = d
     print(f"✅ {len(seen)} unique drugs after deduplication")
     return list(seen.values())
+
 
 def upsert_drugs(drugs, conn):
     with conn.cursor() as cur:
@@ -106,12 +113,13 @@ def upsert_drugs(drugs, conn):
                 d.get("rxcui"),
                 d.get("spl_set_id"),
                 d.get("spl_id"),
-                d.get("marketing_status")
+                d.get("marketing_status"),
             )
-            for d in drugs if d.get("product_ndc")
+            for d in drugs
         ]
-        extras.execute_values(cur, query, rows)
+        extras.execute_values(cur, query, rows, page_size=1000)
     conn.commit()
+
 
 def main():
     conn = psycopg2.connect(DATABASE_URL)
@@ -121,6 +129,7 @@ def main():
         upsert_drugs(unique_drugs, conn)
     finally:
         conn.close()
+
 
 if __name__ == "__main__":
     main()
