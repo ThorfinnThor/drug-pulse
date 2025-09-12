@@ -1,136 +1,185 @@
+#!/usr/bin/env python3
+"""
+RxNorm Enrichment ETL Script
+Enriches drugs in the database with RxNorm IDs, brand/generic names, synonyms.
+Falls back to FDA NDC fields if RxNorm is incomplete.
+"""
+
 import os
 import requests
 import psycopg2
-from psycopg2.extras import execute_values
+from psycopg2 import extras
+from dotenv import load_dotenv
+import logging
+import time
 
-RXNORM_BASE = "https://rxnav.nlm.nih.gov/REST"
+# =========================
+# CONFIG
+# =========================
+LIMIT = 100  # set limit for number of drugs per run
+RXNORM_API = "https://rxnav.nlm.nih.gov/REST"
 
+# Load env vars
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+
+# =========================
+# DB Helpers
+# =========================
 def get_db_connection():
-    return psycopg2.connect(dsn=os.environ["DATABASE_URL"])
+    return psycopg2.connect(DATABASE_URL)
 
-def fetch_drugs(conn, limit=100):
-    """
-    Fetch drugs without RxNorm enrichment.
-    """
-    query = """
-        SELECT id, product_ndc, brand_name, generic_name, substance_name
-        FROM drugs
-        WHERE rxnorm_id IS NULL
-        LIMIT %s;
-    """
-    with conn.cursor() as cur:
-        cur.execute(query, (limit,))
+
+def fetch_drugs_without_rxnorm(conn, limit=LIMIT):
+    """Fetch drugs missing RxNorm ID or names"""
+    with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, preferred_name, generic_name, brand_name, rxcui, product_ndc
+            FROM drugs
+            WHERE rxcui IS NULL OR generic_name IS NULL OR brand_name IS NULL
+            LIMIT %s
+            """,
+            (limit,)
+        )
         return cur.fetchall()
 
-def fetch_rxnorm_data(ndc):
-    """
-    Fetch RxNorm data for a given NDC.
-    """
-    url = f"{RXNORM_BASE}/rxcui.json?idtype=NDC&id={ndc}"
-    r = requests.get(url)
-    if r.status_code != 200:
-        return None
-    data = r.json()
-    if "idGroup" not in data or "rxnormId" not in data["idGroup"]:
-        return None
-    rxcui = data["idGroup"]["rxnormId"][0]
 
-    # Fetch properties (name, synonyms, TTY)
-    props_url = f"{RXNORM_BASE}/rxcui/{rxcui}/allProperties.json?prop=names"
-    r2 = requests.get(props_url)
-    if r2.status_code != 200:
-        return {"rxnorm_id": rxcui}
-    props = r2.json()
+def upsert_rxnorm_data(conn, rows):
+    """Bulk update drugs with RxNorm data"""
+    if not rows:
+        return
 
-    preferred_name, generic_name, brand_name = None, None, None
-    ingredients, synonyms = [], []
-
-    for item in props.get("propConceptGroup", {}).get("propConcept", []):
-        name = item.get("propValue")
-        tty = item.get("propName")
-
-        if tty in ["SCD", "SBD"] and not preferred_name:
-            preferred_name = name
-        if tty == "IN":
-            if not generic_name:
-                generic_name = name
-            ingredients.append(name)
-        if tty == "BN" and not brand_name:
-            brand_name = name
-
-        synonyms.append(name)
-
-    return {
-        "rxnorm_id": rxcui,
-        "preferred_name": preferred_name,
-        "generic_name": generic_name,
-        "brand_name": brand_name,
-        "active_ingredient": ", ".join(ingredients) if ingredients else None,
-        "synonyms": ", ".join(set(synonyms)) if synonyms else None,
-    }
-
-def upsert_rxnorm(conn, updates):
-    """
-    Update drug rows with RxNorm enrichment.
-    """
-    query = """
-        UPDATE drugs
-        SET rxnorm_id = data.rxnorm_id,
-            preferred_name = COALESCE(data.preferred_name, drugs.preferred_name),
-            generic_name = COALESCE(data.generic_name, drugs.generic_name, drugs.substance_name),
-            brand_name = COALESCE(data.brand_name, drugs.brand_name),
-            active_ingredient = COALESCE(data.active_ingredient, drugs.substance_name, drugs.generic_name),
-            synonyms = COALESCE(data.synonyms, drugs.synonyms)
-        FROM (VALUES %s) AS data(
-            id, rxnorm_id, preferred_name, generic_name, brand_name, active_ingredient, synonyms
-        )
-        WHERE drugs.id = data.id::int;
-    """
     with conn.cursor() as cur:
-        execute_values(cur, query, updates)
+        query = """
+        UPDATE drugs AS d
+        SET
+            rxcui = data.rxcui,
+            brand_name = COALESCE(data.brand_name, d.brand_name),
+            generic_name = COALESCE(data.generic_name, d.generic_name),
+            preferred_name = COALESCE(data.preferred_name, d.preferred_name),
+            synonyms = COALESCE(data.synonyms, d.synonyms)
+        FROM (VALUES %s) AS data(id, rxcui, brand_name, generic_name, preferred_name, synonyms)
+        WHERE d.id = data.id::int
+        """
+        values = [
+            (
+                d["id"],
+                d.get("rxcui"),
+                d.get("brand_name"),
+                d.get("generic_name"),
+                d.get("preferred_name"),
+                d.get("synonyms"),
+            )
+            for d in rows
+        ]
+        extras.execute_values(cur, query, values)
     conn.commit()
+    logger.info(f"✅ Updated {len(rows)} drugs with RxNorm/FDA data")
 
-def enrich_rxnorm(batch_size=100):
-    """
-    Main enrichment function.
-    """
+
+# =========================
+# RxNorm API Helpers
+# =========================
+def get_rxcui_by_name(name):
+    """Get RxCUI for a given drug name"""
+    if not name:
+        return None
+    url = f"{RXNORM_API}/rxcui.json?name={requests.utils.quote(name)}"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data.get("idGroup", {}).get("rxnormId", [None])[0]
+    except Exception:
+        return None
+
+
+def parse_rxnorm_names(rxcui):
+    """Fetch brand, generic, preferred name, and synonyms from RxNorm"""
+    if not rxcui:
+        return None, None, None, None
+
+    url = f"{RXNORM_API}/rxcui/{rxcui}/allProperties.json?prop=names"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            return None, None, None, None
+        data = resp.json()
+
+        synonyms = []
+        brand_name, generic_name = None, None
+
+        for entry in data.get("propConceptGroup", {}).get("propConcept", []):
+            name = entry.get("propValue")
+            tty = entry.get("propCategory") or entry.get("propName")
+
+            if name:
+                synonyms.append(name)
+
+            if tty == "BN" and not brand_name:
+                brand_name = name
+            elif tty == "IN" and not generic_name:
+                generic_name = name
+
+        preferred_name = generic_name or brand_name or (synonyms[0] if synonyms else None)
+
+        return brand_name, generic_name, preferred_name, ", ".join(synonyms) if synonyms else None
+
+    except Exception:
+        return None, None, None, None
+
+
+# =========================
+# Main ETL
+# =========================
+def main():
     conn = get_db_connection()
-    drugs = fetch_drugs(conn, limit=batch_size)
-    updates = []
+    try:
+        drugs = fetch_drugs_without_rxnorm(conn, LIMIT)
+        logger.info(f"Found {len(drugs)} drugs to enrich")
 
-    for drug_id, ndc, existing_brand, existing_generic, existing_substance in drugs:
-        info = fetch_rxnorm_data(ndc)
+        enriched = []
+        for d in drugs:
+            name = d["preferred_name"] or d["generic_name"] or d["brand_name"]
+            if not name:
+                continue
 
-        if not info:
-            # no hit → fallback to existing FDA data
-            updates.append((
-                drug_id,
-                None,
-                existing_brand or existing_generic or existing_substance,
-                existing_generic or existing_substance,
-                existing_brand,
-                existing_substance or existing_generic,
-                None
-            ))
-            continue
+            # 1️⃣ Try RxNorm lookup
+            rxcui = d.get("rxcui") or get_rxcui_by_name(name)
+            brand_name, generic_name, preferred_name, synonyms = (None, None, None, None)
+            if rxcui:
+                brand_name, generic_name, preferred_name, synonyms = parse_rxnorm_names(rxcui)
 
-        updates.append((
-            drug_id,
-            info["rxnorm_id"],
-            info["preferred_name"] or existing_brand or existing_generic or existing_substance,
-            info["generic_name"] or existing_generic or existing_substance,
-            info["brand_name"] or existing_brand,
-            info["active_ingredient"] or existing_substance or existing_generic,
-            info["synonyms"]
-        ))
+            # 2️⃣ Fallback to FDA NDC fields if RxNorm is missing
+            if not brand_name and d.get("brand_name"):
+                brand_name = d["brand_name"]
+            if not generic_name and d.get("generic_name"):
+                generic_name = d["generic_name"]
+            if not preferred_name:
+                preferred_name = brand_name or generic_name or d.get("preferred_name")
 
-    if updates:
-        upsert_rxnorm(conn, updates)
-        print(f"✅ Updated {len(updates)} drugs with RxNorm info")
-    else:
-        print("ℹ️ No updates this batch")
+            enriched.append({
+                "id": d["id"],
+                "rxcui": rxcui,
+                "brand_name": brand_name,
+                "generic_name": generic_name,
+                "preferred_name": preferred_name,
+                "synonyms": synonyms
+            })
 
-    conn.close()
+            time.sleep(0.2)  # avoid API rate limit
+
+        upsert_rxnorm_data(conn, enriched)
+
+    finally:
+        conn.close()
+
 
 if __name__ == "__main__":
-    enrich_rxnorm(batch_size=100)
+    main()
