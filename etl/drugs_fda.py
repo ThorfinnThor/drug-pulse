@@ -12,11 +12,14 @@ FDA_NDC_API = "https://api.fda.gov/drug/ndc.json"
 
 def safe_get(value):
     """
-    Normalize FDA fields: return single value as string, or first element if list.
+    Normalize FDA fields: 
+    - If list, join into '; ' string
+    - If string, return directly
+    - Else return None
     """
     if isinstance(value, list):
-        return value[0] if value else None
-    return value
+        return "; ".join([str(v) for v in value if v]) if value else None
+    return str(value) if value else None
 
 def fetch_fda_drugs(limit=1000, max_skip=25000):
     """
@@ -55,16 +58,16 @@ def fetch_fda_drugs(limit=1000, max_skip=25000):
                 "dosage_form": safe_get(openfda.get("dosage_form")),
                 "pharm_class_epc": safe_get(openfda.get("pharm_class_epc")),
                 "pharm_class_moa": safe_get(openfda.get("pharm_class_moa")),
-                "product_type": r.get("product_type"),
-                "dea_schedule": r.get("dea_schedule"),
+                "product_type": safe_get(r.get("product_type")),
+                "dea_schedule": safe_get(r.get("dea_schedule")),
                 "substance_name": safe_get(openfda.get("substance_name")),
                 "unii": safe_get(openfda.get("unii")),
                 "rxcui": safe_get(openfda.get("rxcui")),
                 "spl_set_id": safe_get(r.get("spl_set_id")),
                 "spl_id": safe_get(r.get("spl_id")),
-                "marketing_status": r.get("marketing_status"),
-                "start_marketing_date": r.get("start_marketing_date"),
-                "end_marketing_date": r.get("end_marketing_date")
+                "marketing_status": safe_get(r.get("marketing_status")),
+                "start_marketing_date": safe_get(r.get("start_marketing_date")),
+                "end_marketing_date": safe_get(r.get("end_marketing_date"))
             })
 
         skip += limit
