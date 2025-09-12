@@ -1,110 +1,105 @@
-import os   # ✅ ADD THIS
-import requests
+import os
 import psycopg2
-from psycopg2.extras import execute_values
+import requests
 import time
+import logging
 
-BATCH_SIZE = 20
-RXNORM_API = "https://rxnav.nlm.nih.gov/REST/rxcui.json?idtype=ndc&id="
+# ---------------------------
+# CONFIG
+# ---------------------------
+RXNORM_BASE = "https://rxnav.nlm.nih.gov/REST/rxcui.json"
+BATCH_SIZE = 20   # how many NDCs to query at once
+LIMIT = 100       # limit for faster debugging (set to None for full run)
+SLEEP = 0.2       # delay between API calls
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# ---------------------------
+# DB CONNECTION
+# ---------------------------
 def get_db_connection():
     return psycopg2.connect(dsn=os.environ["DATABASE_URL"])
 
-def fetch_rxcui_batch(ndcs):
-    """Fetch RXCUIs for a batch of NDCs"""
-    ids = "+".join(ndcs)
-    url = RXNORM_API + ids
-    resp = requests.get(url, timeout=30)
-    if resp.status_code != 200:
-        return {}
-    data = resp.json()
-    result = {}
-    for group in data.get("idGroup", {}).get("rxnormIdGroup", []):
-        ndc = group.get("ndc", None)
-        rxcui = group.get("rxnormId", [None])[0]
-        if ndc:
-            result[ndc] = rxcui
-    return result
+# ---------------------------
+# FETCH DRUGS TO ENRICH
+# ---------------------------
+def fetch_drugs(conn):
+    cur = conn.cursor()
+    query = """
+        SELECT id, product_ndc
+        FROM drugs
+        WHERE rxnorm_id IS NULL
+    """
+    if LIMIT:
+        query += f" LIMIT {LIMIT}"
+    cur.execute(query)
+    rows = cur.fetchall()
+    cur.close()
+    return rows
 
+# ---------------------------
+# CALL RXNORM API
+# ---------------------------
+def fetch_rxnorm_id(ndc):
+    """Fetch RxCUI from RxNorm API for a single NDC."""
+    url = f"{RXNORM_BASE}?idtype=ndc&id={ndc}"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        rxnorm_id = data.get("idGroup", {}).get("rxnormId", [None])[0]
+        return rxnorm_id
+    except Exception as e:
+        logging.warning(f"Error fetching NDC {ndc}: {e}")
+        return None
+
+# ---------------------------
+# UPDATE DB
+# ---------------------------
+def update_rxnorm(conn, updates):
+    if not updates:
+        return
+    cur = conn.cursor()
+    for drug_id, rxnorm_id in updates:
+        cur.execute(
+            "UPDATE drugs SET rxnorm_id = %s WHERE id = %s",
+            (rxnorm_id, drug_id),
+        )
+    conn.commit()
+    cur.close()
+
+# ---------------------------
+# MAIN ENRICHMENT
+# ---------------------------
 def enrich_rxnorm():
     conn = get_db_connection()
-    cur = conn.cursor()
+    drugs = fetch_drugs(conn)
+    logging.info(f"Found {len(drugs)} NDCs to enrich (LIMIT={LIMIT})")
 
-    # Get all NDCs without RxCUI
-    cur.execute("SELECT product_ndc FROM drugs WHERE rxcui IS NULL")
-    all_ndcs = [row[0] for row in cur.fetchall()]
-    print(f"Found {len(all_ndcs)} NDCs to enrich")
-
-    resolved = {}
-    unresolved = []
-
-    # First pass: bulk resolve
-    for i in range(0, len(all_ndcs), BATCH_SIZE):
-        batch = all_ndcs[i:i+BATCH_SIZE]
-        try:
-            result = fetch_rxcui_batch(batch)
-            for ndc in batch:
-                if ndc in result and result[ndc]:
-                    resolved[ndc] = result[ndc]
-                else:
-                    unresolved.append(ndc)
-        except Exception as e:
-            print(f"⚠️ Batch failed: {batch[:3]}... {e}")
-            unresolved.extend(batch)
-        time.sleep(0.2)  # respect API limits
-
-    print(f"✅ First pass: resolved {len(resolved)}, unresolved {len(unresolved)}")
-
-    # Write results
-    rows = [(rxcui, ndc) for ndc, rxcui in resolved.items()]
-    if rows:
-        execute_values(cur,
-            "UPDATE drugs SET rxcui = data.rxcui FROM (VALUES %s) AS data(rxcui, product_ndc) WHERE drugs.product_ndc = data.product_ndc",
-            rows)
-        conn.commit()
-
-    # Second pass: fallback with padding
-    still_unresolved = []
-    for ndc in unresolved:
-        variants = generate_variants(ndc)
-        found = None
-        for v in variants:
-            result = fetch_rxcui_batch([v])
-            if v in result and result[v]:
-                found = result[v]
-                break
-            time.sleep(0.3)
-        if found:
-            resolved[ndc] = found
+    updates = []
+    for i, (drug_id, ndc) in enumerate(drugs, 1):
+        rxnorm_id = fetch_rxnorm_id(ndc)
+        if rxnorm_id:
+            updates.append((drug_id, rxnorm_id))
+            logging.info(f"✓ {ndc} → RxNorm ID {rxnorm_id}")
         else:
-            still_unresolved.append(ndc)
+            logging.info(f"✗ {ndc} → No RxNorm ID found")
 
-    print(f"✅ Second pass resolved: {len(unresolved) - len(still_unresolved)} more")
-    print(f"❌ Still unresolved: {len(still_unresolved)}")
+        # batch update every 50 drugs
+        if i % 50 == 0:
+            update_rxnorm(conn, updates)
+            updates.clear()
+            logging.info(f"Committed {i} rows so far...")
 
-    # Write fallback results
-    rows = [(rxcui, ndc) for ndc, rxcui in resolved.items()]
-    if rows:
-        execute_values(cur,
-            "UPDATE drugs SET rxcui = data.rxcui FROM (VALUES %s) AS data(rxcui, product_ndc) WHERE drugs.product_ndc = data.product_ndc",
-            rows)
-        conn.commit()
+        time.sleep(SLEEP)
 
-    cur.close()
+    # Final commit
+    update_rxnorm(conn, updates)
+    logging.info("RxNorm enrichment completed")
     conn.close()
-
-
-def generate_variants(ndc):
-    """Generate padded/unpadded NDC variants"""
-    parts = ndc.split("-")
-    if len(parts) != 2:
-        return [ndc]
-    left, right = parts
-    variants = [ndc]
-    variants.append(f"{left.zfill(5)}-{right.zfill(4)}")  # pad both
-    variants.append(f"{left}-{right.zfill(4)}")          # pad right
-    variants.append(f"{left.zfill(5)}-{right}")          # pad left
-    return list(set(variants))
 
 
 if __name__ == "__main__":
