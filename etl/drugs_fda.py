@@ -41,34 +41,38 @@ def fetch_fda_drugs(limit=1000, max_skip=25000):
             break
 
         for r in results:
-            openfda = r.get("openfda", {})
+    openfda = r.get("openfda", {})
 
-            brand = safe_get(openfda.get("brand_name"))
-            generic = safe_get(openfda.get("generic_name"))
-            preferred_name = brand or generic or r.get("product_ndc") or "UNKNOWN"
+    preferred_name = (
+        (openfda.get("brand_name") or [None])[0]
+        or (openfda.get("generic_name") or [None])[0]
+        or (openfda.get("substance_name") or [None])[0]
+        or r.get("product_ndc")
+    )
 
-            drugs.append({
-                "preferred_name": preferred_name,
-                "generic_name": generic,
-                "brand_name": brand,
-                "manufacturer_name": safe_get(openfda.get("manufacturer_name")),
-                "product_ndc": r.get("product_ndc"),
-                "package_ndc": safe_get(r.get("package_ndc")),
-                "route": safe_get(openfda.get("route")),
-                "dosage_form": safe_get(openfda.get("dosage_form")),
-                "pharm_class_epc": safe_get(openfda.get("pharm_class_epc")),
-                "pharm_class_moa": safe_get(openfda.get("pharm_class_moa")),
-                "product_type": safe_get(r.get("product_type")),
-                "dea_schedule": safe_get(r.get("dea_schedule")),
-                "substance_name": safe_get(openfda.get("substance_name")),
-                "unii": safe_get(openfda.get("unii")),
-                "rxcui": safe_get(openfda.get("rxcui")),
-                "spl_set_id": safe_get(r.get("spl_set_id")),
-                "spl_id": safe_get(r.get("spl_id")),
-                "marketing_status": safe_get(r.get("marketing_status")),
-                "start_marketing_date": safe_get(r.get("start_marketing_date")),
-                "end_marketing_date": safe_get(r.get("end_marketing_date"))
-            })
+    drugs.append({
+        "preferred_name": preferred_name,
+        "generic_name": (openfda.get("generic_name") or [None])[0],
+        "brand_name": (openfda.get("brand_name") or [None])[0],
+        "manufacturer_name": (openfda.get("manufacturer_name") or [None])[0],
+        "product_ndc": r.get("product_ndc"),
+        "package_ndc": (r.get("package_ndc") or [None])[0] if isinstance(r.get("package_ndc"), list) else r.get("package_ndc"),
+        "route": (openfda.get("route") or [None])[0],
+        "dosage_form": (openfda.get("dosage_form") or [None])[0],
+        "pharm_class_epc": (openfda.get("pharm_class_epc") or [None])[0],
+        "pharm_class_moa": (openfda.get("pharm_class_moa") or [None])[0],
+        "product_type": r.get("product_type"),
+        "dea_schedule": r.get("dea_schedule"),
+        "substance_name": (openfda.get("substance_name") or [None])[0],
+        "unii": (openfda.get("unii") or [None])[0],
+        "rxcui": (openfda.get("rxcui") or [None])[0],
+        "marketing_status": r.get("marketing_status"),
+        "start_marketing_date": r.get("start_marketing_date"),
+        "end_marketing_date": r.get("end_marketing_date"),
+        "spl_set_id": r.get("spl_set_id"),
+        "spl_id": r.get("id")
+    })
+
 
         skip += limit
 
