@@ -6,7 +6,7 @@ Populate drugs.rxnorm_id using RxNav.
 Strategy:
   1) Try NDC → RxCUI (most reliable)
   2) Fallback to approximateTerm(name) → RxCUI
-Only rows with a found RxCUI are updated. No other columns are touched.
+Updates are written in batches to avoid connection resets.
 """
 
 import os
@@ -26,9 +26,9 @@ from dotenv import load_dotenv
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 RXNAV_BASE = "https://rxnav.nlm.nih.gov/REST"
-LIMIT = int(os.getenv("RXNORM_LIMIT", "1000"))      # number of rows to attempt per run
+LIMIT = int(os.getenv("RXNORM_LIMIT", "100"))      # number of rows to attempt per run
 HTTP_TIMEOUT = float(os.getenv("RXNORM_HTTP_TIMEOUT", "12"))
-SLEEP = float(os.getenv("RXNORM_SLEEP", "0.10"))    # polite delay between HTTP calls
+SLEEP = float(os.getenv("RXNORM_SLEEP", "0.10"))   # polite delay between HTTP calls
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("drugs_rxnorm")
@@ -61,7 +61,7 @@ def fetch_targets(conn, limit: int) -> List[dict]:
         return cur.fetchall()
 
 
-def update_rxnorm_ids(conn, rows, batch_size=200):
+def update_rxnorm_ids(conn, rows: List[Tuple[int, str]], batch_size: int = 200) -> None:
     """Bulk set rxnorm_id for the given (id, rxnorm_id) tuples in smaller batches."""
     if not rows:
         log.info("Nothing to update.")
@@ -76,7 +76,7 @@ def update_rxnorm_ids(conn, rows, batch_size=200):
 
     with conn.cursor() as cur:
         for i in range(0, len(rows), batch_size):
-            chunk = rows[i:i+batch_size]
+            chunk = rows[i:i + batch_size]
             extras.execute_values(cur, query, chunk, page_size=batch_size)
     conn.commit()
     log.info("✅ Set rxnorm_id for %d rows (in batches of %d)", len(rows), batch_size)
@@ -97,11 +97,7 @@ def http_get_json(url: str) -> Optional[dict]:
 
 
 def normalize_ndc_candidates(ndc_raw: str) -> Iterable[str]:
-    """
-    Produce a few common NDC formats to maximize hit rate.
-    - digits only (10 or 11)
-    - hyphenated 5-4-2 when length allows
-    """
+    """Produce common NDC formats to maximize hit rate."""
     if not ndc_raw:
         return []
     s = re.sub(r"[^0-9]", "", ndc_raw)
@@ -111,8 +107,8 @@ def normalize_ndc_candidates(ndc_raw: str) -> Iterable[str]:
         # digits-only
         cands.add(s)
 
-        # hyphenate as 5-4-2 when possible (most 11-digit GTIN-style)
         if len(s) == 11:
+            # hyphenated 5-4-2
             a, b, c = s[:5], s[5:9], s[9:]
             cands.add(f"{a}-{b}-{c}")
         elif len(s) == 10:
@@ -141,7 +137,7 @@ def clean_name(name: str) -> str:
     if not name:
         return ""
     s = name
-    s = re.sub(r"\(.*?\)", " ", s)                     # remove parentheticals
+    s = re.sub(r"\(.*?\)", " ", s)
     s = re.sub(r"\b\d+(\.\d+)?\s*(mg|mcg|g|iu|ml|mL|%|units)\b", " ", s, flags=re.I)
     s = re.sub(r"\b(oral|tablet|capsule|solution|suspension|injection|spray|ointment|cream|patch|gel|extended release|er|xr)\b", " ", s, flags=re.I)
     s = re.sub(r"[^A-Za-z0-9\s\-]", " ", s)
@@ -150,7 +146,7 @@ def clean_name(name: str) -> str:
 
 
 def rxcui_from_name(name: str) -> Optional[str]:
-    """Name → RxCUI using approximateTerm (more forgiving than exact)."""
+    """Name → RxCUI using approximateTerm (forgiving)."""
     if not name:
         return None
     term = clean_name(name)
