@@ -1,143 +1,115 @@
-#!/usr/bin/env python3
-"""
-RxNorm ETL Script
-Enriches drugs table with RxCUI + synonyms from RxNav API
-Optimized with batching, parallelization, and caching
-"""
 import os
 import time
-import psycopg2
 import requests
+import psycopg2
 from psycopg2 import extras
-from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
 
-# Load env
+# Load environment variables
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 RXNORM_BASE = "https://rxnav.nlm.nih.gov/REST"
 
-# -----------------------
-# DB Helpers
-# -----------------------
-def get_connection():
-    return psycopg2.connect(DATABASE_URL)
 
-def ensure_cache_table(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS rxnorm_cache (
-            product_ndc TEXT PRIMARY KEY,
-            rxcui TEXT,
-            synonyms TEXT[],
-            fetched_at TIMESTAMP DEFAULT now()
-        );
-        """)
-    conn.commit()
-
-# -----------------------
-# RxNorm API Helpers
-# -----------------------
-def fetch_rxcui_batch(ndcs):
-    """Fetch RxCUI for a batch of NDCs."""
-    ids = "+".join(ndcs)
-    url = f"{RXNORM_BASE}/rxcui?idtype=ndc&id={ids}&allsrc=1"
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"⚠️ Error fetching batch {ndcs}: {e}")
-        return {}
+# --------------------------
+# Fetch functions
+# --------------------------
 
 def fetch_synonyms(rxcui):
     """Fetch synonyms for a given RxCUI."""
-    url = f"{RXNORM_BASE}/rxcui/{rxcui}/property.json?propName=allName"
+    if not rxcui:
+        return []
+    url = f"{RXNORM_BASE}/rxcui/{rxcui}/allProperties.json?prop=all"
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         props = data.get("propConceptGroup", {}).get("propConcept", [])
-        return [p.get("propValue") for p in props if p.get("propValue")]
-    except Exception:
+        return list({p.get("propValue") for p in props if "propValue" in p})
+    except Exception as e:
+        print(f"⚠️ Error fetching synonyms for {rxcui}: {e}")
         return []
 
-# -----------------------
-# Main Logic
-# -----------------------
-def enrich_ndcs(ndcs, conn, workers=10, batch_size=20):
-    """Enrich a list of NDCs with RxNorm data."""
+
+def fetch_rxcui_for_ndc(ndc):
+    """Fetch RxCUI + synonyms for a single NDC."""
+    url = f"{RXNORM_BASE}/rxcui?idtype=ndc&id={ndc}&allsrc=1"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        rxcui = data.get("idGroup", {}).get("rxnormId", [None])[0]
+        synonyms = fetch_synonyms(rxcui) if rxcui else []
+        return (ndc, rxcui, synonyms)
+    except Exception as e:
+        print(f"⚠️ Error fetching NDC {ndc}: {e}")
+        return (ndc, None, [])
+
+
+# --------------------------
+# Enrichment
+# --------------------------
+
+def enrich_ndcs(ndcs, workers=20):
+    """Enrich a list of NDCs with RxNorm data in parallel (per-NDC)."""
     results = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = []
-        # Batch NDCs
-        for i in range(0, len(ndcs), batch_size):
-            batch = ndcs[i:i + batch_size]
-            futures.append(executor.submit(fetch_rxcui_batch, batch))
-
+        futures = {executor.submit(fetch_rxcui_for_ndc, ndc): ndc for ndc in ndcs}
         for future in as_completed(futures):
-            data = future.result()
-            if not data:
-                continue
-            id_group = data.get("idGroup", {})
-            ndc_list = id_group.get("ndcList", {}).get("ndc", [])
-            rxnorm_ids = id_group.get("rxnormId", [])
-            for ndc, rxcui in zip(ndc_list, rxnorm_ids):
-                synonyms = fetch_synonyms(rxcui)
-                results.append((ndc, rxcui, synonyms))
+            results.append(future.result())
     return results
 
-def upsert_cache(results, conn):
+
+# --------------------------
+# Database operations
+# --------------------------
+
+def get_ndcs_to_enrich(conn):
+    """Get NDCs from the database that do not yet have an RxCUI."""
     with conn.cursor() as cur:
-        extras.execute_values(cur, """
-        INSERT INTO rxnorm_cache (product_ndc, rxcui, synonyms)
-        VALUES %s
-        ON CONFLICT (product_ndc) DO UPDATE SET
-            rxcui = EXCLUDED.rxcui,
-            synonyms = EXCLUDED.synonyms,
-            fetched_at = now();
-        """, results)
+        cur.execute("SELECT product_ndc FROM drugs WHERE rxcui IS NULL")
+        rows = cur.fetchall()
+    return [r[0] for r in rows if r[0]]
+
+
+def upsert_rxnorm_data(results, conn):
+    """Upsert RxNorm data back into the drugs table."""
+    with conn.cursor() as cur:
+        query = """
+        UPDATE drugs
+        SET rxcui = data.rxcui,
+            synonyms = data.synonyms
+        FROM (VALUES %s) AS data(ndc, rxcui, synonyms)
+        WHERE drugs.product_ndc = data.ndc;
+        """
+        rows = [
+            (ndc, rxcui, synonyms if synonyms else None)
+            for ndc, rxcui, synonyms in results
+        ]
+        extras.execute_values(cur, query, rows, page_size=500)
     conn.commit()
 
-def update_drugs(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-        UPDATE drugs d
-        SET rxcui = c.rxcui,
-            drug_synonyms = c.synonyms
-        FROM rxnorm_cache c
-        WHERE d.product_ndc = c.product_ndc;
-        """)
-    conn.commit()
+
+# --------------------------
+# Main
+# --------------------------
 
 def main():
-    conn = get_connection()
-    ensure_cache_table(conn)
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        ndcs = get_ndcs_to_enrich(conn)
+        print(f"🔍 Found {len(ndcs)} new NDCs to enrich")
 
-    with conn.cursor() as cur:
-        # Get all product_ndc values not yet cached
-        cur.execute("""
-        SELECT product_ndc FROM drugs
-        WHERE product_ndc IS NOT NULL
-        AND product_ndc NOT IN (SELECT product_ndc FROM rxnorm_cache);
-        """)
-        ndcs = [row[0] for row in cur.fetchall()]
+        results = enrich_ndcs(ndcs, workers=20)
 
-    print(f"🔎 Found {len(ndcs)} new NDCs to enrich")
+        upsert_rxnorm_data(results, conn)
+        print(f"✅ Enriched {len(results)} NDCs with RxNorm data")
 
-    if ndcs:
-        results = enrich_ndcs(ndcs, conn)
-        if results:
-            upsert_cache(results, conn)
-            print(f"✅ Cached {len(results)} new RxNorm mappings")
-        else:
-            print("⚠️ No new RxNorm results fetched")
+    finally:
+        conn.close()
 
-    update_drugs(conn)
-    print("✅ Drugs table updated with RxNorm data")
-
-    conn.close()
 
 if __name__ == "__main__":
     main()
