@@ -22,7 +22,7 @@ def safe_get(value):
 # --------------------------
 # Fetch drugs from FDA API
 # --------------------------
-def fetch_fda_drugs(limit=1000, max_skip=1000):
+def fetch_fda_drugs(limit=1000, max_skip=50):
     drugs = []
     skip = 0
     while skip < max_skip:
