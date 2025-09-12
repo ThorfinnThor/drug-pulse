@@ -62,6 +62,12 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
+      - name: Run FDA Drugs ETL
+        run: |
+          cd etl
+          python drugs_rxnorm.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
   
 
       - name: Refresh search materialized view
