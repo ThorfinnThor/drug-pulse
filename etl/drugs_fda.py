@@ -10,6 +10,14 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 FDA_NDC_API = "https://api.fda.gov/drug/ndc.json"
 
+def safe_get(value):
+    """
+    Normalize FDA fields: return single value as string, or first element if list.
+    """
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
 def fetch_fda_drugs(limit=1000, max_skip=25000):
     """
     Fetch drug data from the FDA NDC API with pagination up to skip limit.
@@ -32,36 +40,28 @@ def fetch_fda_drugs(limit=1000, max_skip=25000):
         for r in results:
             openfda = r.get("openfda", {})
 
-            # Robust preferred_name fallback
-            preferred_name = None
-            brand = openfda.get("brand_name")
-            generic = openfda.get("generic_name")
-
-            if brand and isinstance(brand, list) and len(brand) > 0:
-                preferred_name = brand[0]
-            elif generic and isinstance(generic, list) and len(generic) > 0:
-                preferred_name = generic[0]
-            else:
-                preferred_name = r.get("product_ndc") or "UNKNOWN"
+            brand = safe_get(openfda.get("brand_name"))
+            generic = safe_get(openfda.get("generic_name"))
+            preferred_name = brand or generic or r.get("product_ndc") or "UNKNOWN"
 
             drugs.append({
                 "preferred_name": preferred_name,
-                "generic_name": (generic[0] if generic and isinstance(generic, list) else None),
-                "brand_name": (brand[0] if brand and isinstance(brand, list) else None),
-                "manufacturer_name": (openfda.get("manufacturer_name") or [None])[0],
+                "generic_name": generic,
+                "brand_name": brand,
+                "manufacturer_name": safe_get(openfda.get("manufacturer_name")),
                 "product_ndc": r.get("product_ndc"),
-                "package_ndc": (r.get("package_ndc") or [None])[0] if isinstance(r.get("package_ndc"), list) else r.get("package_ndc"),
-                "route": (openfda.get("route") or [None])[0],
-                "dosage_form": (openfda.get("dosage_form") or [None])[0],
-                "pharm_class_epc": (openfda.get("pharm_class_epc") or [None])[0],
-                "pharm_class_moa": (openfda.get("pharm_class_moa") or [None])[0],
+                "package_ndc": safe_get(r.get("package_ndc")),
+                "route": safe_get(openfda.get("route")),
+                "dosage_form": safe_get(openfda.get("dosage_form")),
+                "pharm_class_epc": safe_get(openfda.get("pharm_class_epc")),
+                "pharm_class_moa": safe_get(openfda.get("pharm_class_moa")),
                 "product_type": r.get("product_type"),
                 "dea_schedule": r.get("dea_schedule"),
-                "substance_name": (openfda.get("substance_name") or [None])[0],
-                "unii": (openfda.get("unii") or [None])[0],
-                "rxcui": (openfda.get("rxcui") or [None])[0],
-                "spl_set_id": r.get("spl_set_id"),
-                "spl_id": r.get("spl_id"),
+                "substance_name": safe_get(openfda.get("substance_name")),
+                "unii": safe_get(openfda.get("unii")),
+                "rxcui": safe_get(openfda.get("rxcui")),
+                "spl_set_id": safe_get(r.get("spl_set_id")),
+                "spl_id": safe_get(r.get("spl_id")),
                 "marketing_status": r.get("marketing_status"),
                 "start_marketing_date": r.get("start_marketing_date"),
                 "end_marketing_date": r.get("end_marketing_date")
@@ -71,7 +71,6 @@ def fetch_fda_drugs(limit=1000, max_skip=25000):
 
     print(f"✅ Fetched {len(drugs)} drugs from FDA NDC API")
     return drugs
-
 
 def deduplicate_drugs(drugs):
     """
@@ -84,7 +83,6 @@ def deduplicate_drugs(drugs):
             seen[key] = d
     print(f"✅ {len(seen)} unique drugs after deduplication")
     return list(seen.values())
-
 
 def upsert_drugs(drugs, conn):
     with conn.cursor() as cur:
@@ -140,7 +138,6 @@ def upsert_drugs(drugs, conn):
         extras.execute_values(cur, query, rows, page_size=500)
     conn.commit()
 
-
 def main():
     conn = psycopg2.connect(DATABASE_URL)
     try:
@@ -149,7 +146,6 @@ def main():
         upsert_drugs(unique_drugs, conn)
     finally:
         conn.close()
-
 
 if __name__ == "__main__":
     main()
