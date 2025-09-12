@@ -1,117 +1,143 @@
+#!/usr/bin/env python3
+"""
+RxNorm ETL Script
+Enriches drugs table with RxCUI + synonyms from RxNav API
+Optimized with batching, parallelization, and caching
+"""
 import os
-import requests
+import time
 import psycopg2
+import requests
 from psycopg2 import extras
 from dotenv import load_dotenv
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Load env
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 RXNORM_BASE = "https://rxnav.nlm.nih.gov/REST"
 
-def fetch_rxcui_by_ndc(ndc: str):
-    """Fetch RxCUI for a given NDC code"""
-    url = f"{RXNORM_BASE}/rxcui.json?idtype=ndc&id={ndc}"
-    resp = requests.get(url)
-    if resp.status_code != 200:
-        return None
-    data = resp.json()
-    return data.get("idGroup", {}).get("rxnormId", [None])[0]
+# -----------------------
+# DB Helpers
+# -----------------------
+def get_connection():
+    return psycopg2.connect(DATABASE_URL)
 
-def fetch_rxnorm_properties(rxcui: str):
-    """Fetch drug properties (name, synonyms) for RxCUI"""
-    url = f"{RXNORM_BASE}/rxcui/{rxcui}/allProperties.json?prop=names"
-    resp = requests.get(url)
-    if resp.status_code != 200:
-        return None, []
-    data = resp.json()
-    props = data.get("propConceptGroup", {}).get("propConcept", [])
-    names = [p["propValue"] for p in props if "propValue" in p]
-
-    # Best guess: first is preferred name
-    preferred_name = names[0] if names else None
-    return preferred_name, names
-
-def upsert_rxnorm(conn, rows):
-    """Upsert RxNorm data into drugs table and synonyms table"""
-    with conn.cursor() as cur:
-        # Update drugs table
-        query = """
-        UPDATE drugs d
-        SET rxcui = data.rxcui,
-            generic_name = COALESCE(data.generic_name, d.generic_name),
-            brand_name = COALESCE(data.brand_name, d.brand_name)
-        FROM (VALUES %s) AS data(product_ndc, rxcui, generic_name, brand_name)
-        WHERE d.product_ndc = data.product_ndc;
-        """
-        extras.execute_values(
-            cur, query, rows, template=None, page_size=500
-        )
-    conn.commit()
-
-def insert_synonyms(conn, synonym_rows):
-    """Insert synonyms into drug_synonyms table (create if not exists)"""
+def ensure_cache_table(conn):
     with conn.cursor() as cur:
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS drug_synonyms (
-            id SERIAL PRIMARY KEY,
-            drug_id INT REFERENCES drugs(id) ON DELETE CASCADE,
-            synonym TEXT,
-            created_at TIMESTAMPTZ DEFAULT NOW()
+        CREATE TABLE IF NOT EXISTS rxnorm_cache (
+            product_ndc TEXT PRIMARY KEY,
+            rxcui TEXT,
+            synonyms TEXT[],
+            fetched_at TIMESTAMP DEFAULT now()
         );
         """)
-        query = """
-        INSERT INTO drug_synonyms (drug_id, synonym)
+    conn.commit()
+
+# -----------------------
+# RxNorm API Helpers
+# -----------------------
+def fetch_rxcui_batch(ndcs):
+    """Fetch RxCUI for a batch of NDCs."""
+    ids = "+".join(ndcs)
+    url = f"{RXNORM_BASE}/rxcui?idtype=ndc&id={ids}&allsrc=1"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"⚠️ Error fetching batch {ndcs}: {e}")
+        return {}
+
+def fetch_synonyms(rxcui):
+    """Fetch synonyms for a given RxCUI."""
+    url = f"{RXNORM_BASE}/rxcui/{rxcui}/property.json?propName=allName"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        props = data.get("propConceptGroup", {}).get("propConcept", [])
+        return [p.get("propValue") for p in props if p.get("propValue")]
+    except Exception:
+        return []
+
+# -----------------------
+# Main Logic
+# -----------------------
+def enrich_ndcs(ndcs, conn, workers=10, batch_size=20):
+    """Enrich a list of NDCs with RxNorm data."""
+    results = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = []
+        # Batch NDCs
+        for i in range(0, len(ndcs), batch_size):
+            batch = ndcs[i:i + batch_size]
+            futures.append(executor.submit(fetch_rxcui_batch, batch))
+
+        for future in as_completed(futures):
+            data = future.result()
+            if not data:
+                continue
+            id_group = data.get("idGroup", {})
+            ndc_list = id_group.get("ndcList", {}).get("ndc", [])
+            rxnorm_ids = id_group.get("rxnormId", [])
+            for ndc, rxcui in zip(ndc_list, rxnorm_ids):
+                synonyms = fetch_synonyms(rxcui)
+                results.append((ndc, rxcui, synonyms))
+    return results
+
+def upsert_cache(results, conn):
+    with conn.cursor() as cur:
+        extras.execute_values(cur, """
+        INSERT INTO rxnorm_cache (product_ndc, rxcui, synonyms)
         VALUES %s
-        ON CONFLICT DO NOTHING;
-        """
-        extras.execute_values(cur, query, synonym_rows, page_size=500)
+        ON CONFLICT (product_ndc) DO UPDATE SET
+            rxcui = EXCLUDED.rxcui,
+            synonyms = EXCLUDED.synonyms,
+            fetched_at = now();
+        """, results)
+    conn.commit()
+
+def update_drugs(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+        UPDATE drugs d
+        SET rxcui = c.rxcui,
+            drug_synonyms = c.synonyms
+        FROM rxnorm_cache c
+        WHERE d.product_ndc = c.product_ndc;
+        """)
     conn.commit()
 
 def main():
-    conn = psycopg2.connect(DATABASE_URL)
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id, product_ndc FROM drugs WHERE product_ndc IS NOT NULL;")
-        ndc_rows = cur.fetchall()
+    conn = get_connection()
+    ensure_cache_table(conn)
 
-        update_rows = []
-        synonym_rows = []
+    with conn.cursor() as cur:
+        # Get all product_ndc values not yet cached
+        cur.execute("""
+        SELECT product_ndc FROM drugs
+        WHERE product_ndc IS NOT NULL
+        AND product_ndc NOT IN (SELECT product_ndc FROM rxnorm_cache);
+        """)
+        ndcs = [row[0] for row in cur.fetchall()]
 
-        for drug_id, ndc in ndc_rows:
-            if not ndc:
-                continue
-            rxcui = fetch_rxcui_by_ndc(ndc)
-            if not rxcui:
-                continue
+    print(f"🔎 Found {len(ndcs)} new NDCs to enrich")
 
-            preferred_name, synonyms = fetch_rxnorm_properties(rxcui)
-            if not preferred_name:
-                continue
+    if ndcs:
+        results = enrich_ndcs(ndcs, conn)
+        if results:
+            upsert_cache(results, conn)
+            print(f"✅ Cached {len(results)} new RxNorm mappings")
+        else:
+            print("⚠️ No new RxNorm results fetched")
 
-            # Heuristic: if multiple names, pick the shortest as generic_name
-            generic_name = min(synonyms, key=len) if synonyms else None
-            brand_name = preferred_name if preferred_name != generic_name else None
+    update_drugs(conn)
+    print("✅ Drugs table updated with RxNorm data")
 
-            update_rows.append((ndc, rxcui, generic_name, brand_name))
-
-            for syn in synonyms:
-                synonym_rows.append((drug_id, syn))
-
-            time.sleep(0.2)  # avoid hammering API
-
-        if update_rows:
-            upsert_rxnorm(conn, update_rows)
-
-        if synonym_rows:
-            insert_synonyms(conn, synonym_rows)
-
-        print(f"✅ Updated {len(update_rows)} drugs with RxNorm data")
-        print(f"✅ Inserted {len(synonym_rows)} synonyms")
-
-    finally:
-        conn.close()
+    conn.close()
 
 if __name__ == "__main__":
     main()
