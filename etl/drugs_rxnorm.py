@@ -16,7 +16,7 @@ import time
 # =========================
 # CONFIG
 # =========================
-LIMIT = 500  # set limit for number of drugs per run
+LIMIT = 100  # set limit for number of drugs per run
 RXNORM_API = "https://rxnav.nlm.nih.gov/REST"
 
 # Load env vars
