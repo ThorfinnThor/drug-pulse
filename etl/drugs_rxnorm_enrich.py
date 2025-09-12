@@ -2,7 +2,10 @@
 """
 drugs_rxnorm_enrich.py
 ----------------------
-Enrich drugs with ingredient, tradename, and synonyms using RxNorm allRelated.json.
+Enrich drugs with ingredient, tradename, and synonyms using RxNorm.
+- First try allRelated.json
+- If 404 or empty, fallback to related.json
+- As last resort, use properties.json
 """
 
 import os
@@ -12,14 +15,10 @@ import psycopg2
 from psycopg2 import extras
 import requests
 
-# -------------------------
-# Config
-# -------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 RXNAV_BASE = "https://rxnav.nlm.nih.gov/REST"
 LIMIT = int(os.getenv("RXNORM_ENRICH_LIMIT", "100"))
 SLEEP_BETWEEN_CALLS = float(os.getenv("RXNORM_SLEEP", "0.1"))
-
 SYN_TTYS = {"BN", "SBD", "SCD", "IN", "PIN", "MIN"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -52,7 +51,6 @@ def select_rows_to_enrich(conn, limit):
 def upsert_enrichments(conn, rows):
     if not rows:
         return
-
     query = """
         UPDATE drugs AS d
         SET
@@ -62,16 +60,10 @@ def upsert_enrichments(conn, rows):
         FROM (VALUES %s) AS data(id, ingredient, tradename, synonyms)
         WHERE d.id = data.id::int
     """
-
-    values = [
-        (drug_id, ing, bn, syn)
-        for (drug_id, ing, bn, syn) in rows
-    ]
-
     with conn.cursor() as cur:
-        extras.execute_values(cur, query, values)
+        extras.execute_values(cur, query, rows, page_size=500)
     conn.commit()
-    logger.info(f"✅ Updated {len(rows)} drugs with ingredient/tradename/synonyms")
+    logger.info("✅ Updated %d drugs with ingredient/tradename/synonyms", len(rows))
 
 
 # -------------------------
@@ -79,7 +71,7 @@ def upsert_enrichments(conn, rows):
 # -------------------------
 def http_get_json(url: str):
     try:
-        resp = requests.get(url, timeout=10, headers={"User-Agent": "drug-pulse/1.0"})
+        resp = requests.get(url, timeout=12, headers={"User-Agent": "pharmaintel/1.0"})
         if resp.status_code == 200:
             return resp.json()
         logger.warning("RxNav non-200 (%s) for %s", resp.status_code, url)
@@ -88,40 +80,51 @@ def http_get_json(url: str):
     return None
 
 
-def parse_related_for_enrichment(data):
+def parse_concepts(concept_groups):
     ingredient, tradename = None, None
     synonyms = set()
 
-    groups = data.get("allRelatedGroup", {}).get("conceptGroup", [])
-    for grp in groups:
+    for grp in concept_groups:
         tty = (grp.get("tty") or "").upper().strip()
         props = grp.get("conceptProperties") or []
-        if not props:
-            continue
-
-        if tty == "IN" and not ingredient:
-            ingredient = props[0].get("name")
-        if tty == "PIN" and not ingredient:
-            ingredient = props[0].get("name")
-        if tty == "BN" and not tradename:
-            tradename = props[0].get("name")
-
-        if tty in SYN_TTYS:
-            for p in props:
-                name = p.get("name")
-                if name:
-                    synonyms.add(name)
+        for p in props:
+            name = p.get("name")
+            if not name:
+                continue
+            if tty == "IN" and not ingredient:
+                ingredient = name
+            if tty == "BN" and not tradename:
+                tradename = name
+            if tty in SYN_TTYS:
+                synonyms.add(name)
 
     syn_str = " | ".join(sorted(synonyms)) if synonyms else None
     return ingredient, tradename, syn_str
 
 
 def enrich_one_rxcui(rxcui):
-    url = f"{RXNAV_BASE}/rxcui/{rxcui}/allRelated.json"
-    data = http_get_json(url)
-    if not data:
-        return None, None, None
-    return parse_related_for_enrichment(data)
+    # 1) Try allRelated.json
+    data = http_get_json(f"{RXNAV_BASE}/rxcui/{rxcui}/allRelated.json")
+    if data and "allRelatedGroup" in data:
+        groups = data["allRelatedGroup"].get("conceptGroup", [])
+        if groups:
+            return parse_concepts(groups)
+
+    # 2) Fallback: related.json with specific TTYS
+    data = http_get_json(f"{RXNAV_BASE}/rxcui/{rxcui}/related.json?tty=IN+BN+SCD+SBD")
+    if data and "relatedGroup" in data:
+        groups = data["relatedGroup"].get("conceptGroup", [])
+        if groups:
+            return parse_concepts(groups)
+
+    # 3) Fallback: properties.json (just get preferred name as synonym)
+    data = http_get_json(f"{RXNAV_BASE}/rxcui/{rxcui}/properties.json")
+    if data and "properties" in data:
+        name = data["properties"].get("name")
+        if name:
+            return None, None, name
+
+    return None, None, None
 
 
 # -------------------------
@@ -131,7 +134,7 @@ def main():
     conn = get_db_connection()
     try:
         targets = select_rows_to_enrich(conn, LIMIT)
-        logger.info(f"Found {len(targets)} drugs to enrich")
+        logger.info("Found %d drugs to enrich", len(targets))
 
         enriched = []
         for (drug_id, rxcui) in targets:
