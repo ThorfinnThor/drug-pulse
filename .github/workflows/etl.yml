@@ -58,6 +58,13 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
+      - name: Run FDA Drugs ETL
+        run: |
+          cd etl
+          python drugs_orangebook.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
       - name: Refresh search materialized view
         run: |
           psql "$DATABASE_URL" -c "refresh materialized view search_mv;"
