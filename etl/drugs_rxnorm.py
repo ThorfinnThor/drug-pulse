@@ -1,3 +1,4 @@
+import os   # ✅ ADD THIS
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
