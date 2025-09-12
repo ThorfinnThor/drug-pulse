@@ -2,14 +2,19 @@
 """
 drugs_rxnorm.py
 ---------------
-Resolve RxNorm IDs (RxCUI) for drugs in the DB using RxNav API.
-Populates: rxnorm_id, brand_name, generic_name, synonyms.
-Keeps FDA preferred_name untouched.
+Populate drugs.rxnorm_id using RxNav.
+Strategy:
+  1) Try NDC → RxCUI (most reliable)
+  2) Fallback to approximateTerm(name) → RxCUI
+Only rows with a found RxCUI are updated. No other columns are touched.
 """
 
 import os
+import re
 import time
 import logging
+from typing import Iterable, List, Optional, Tuple
+
 import requests
 import psycopg2
 from psycopg2 import extras
@@ -20,28 +25,34 @@ from dotenv import load_dotenv
 # -------------------------
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
-RXNORM_API = "https://rxnav.nlm.nih.gov/REST"
-LIMIT = int(os.getenv("RXNORM_LIMIT", "100"))
+RXNAV_BASE = "https://rxnav.nlm.nih.gov/REST"
+LIMIT = int(os.getenv("RXNORM_LIMIT", "100"))      # number of rows to attempt per run
+HTTP_TIMEOUT = float(os.getenv("RXNORM_HTTP_TIMEOUT", "12"))
+SLEEP = float(os.getenv("RXNORM_SLEEP", "0.10"))    # polite delay between HTTP calls
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+log = logging.getLogger("drugs_rxnorm")
 
 
 # -------------------------
 # DB helpers
 # -------------------------
-def get_db_connection():
+def get_db() -> psycopg2.extensions.connection:
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
     return psycopg2.connect(DATABASE_URL)
 
 
-def fetch_drugs_without_rxnorm(conn, limit=LIMIT):
-    """Fetch drugs missing RxNorm ID"""
+def fetch_targets(conn, limit: int) -> List[dict]:
+    """Rows missing rxnorm_id but with something we can use (NDC or a name)."""
     with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT id, preferred_name, brand_name, generic_name
+            SELECT id, product_ndc, preferred_name, generic_name, brand_name
             FROM drugs
             WHERE rxnorm_id IS NULL
+              AND (product_ndc IS NOT NULL OR preferred_name IS NOT NULL
+                   OR generic_name IS NOT NULL OR brand_name IS NOT NULL)
             ORDER BY id
             LIMIT %s
             """,
@@ -50,119 +61,143 @@ def fetch_drugs_without_rxnorm(conn, limit=LIMIT):
         return cur.fetchall()
 
 
-def upsert_rxnorm_data(conn, rows):
-    """Bulk update drugs with RxNorm data"""
+def update_rxnorm_ids(conn, rows: List[Tuple[int, str]]) -> None:
+    """Bulk set rxnorm_id for the given (id, rxnorm_id) tuples."""
     if not rows:
+        log.info("Nothing to update.")
         return
-
     with conn.cursor() as cur:
         query = """
-        UPDATE drugs AS d
-        SET
-            rxnorm_id = data.rxnorm_id,
-            brand_name = COALESCE(data.brand_name, d.brand_name),
-            generic_name = COALESCE(data.generic_name, d.generic_name),
-            rxnorm_synonyms = COALESCE(data.synonyms, d.rxnorm_synonyms)
-        FROM (VALUES %s) AS data(id, rxnorm_id, brand_name, generic_name, synonyms)
-        WHERE d.id = data.id::int
+            UPDATE drugs AS d
+            SET rxnorm_id = data.rxnorm_id
+            FROM (VALUES %s) AS data(id, rxnorm_id)
+            WHERE d.id = data.id::int
         """
-        values = [
-            (
-                d["id"],
-                d.get("rxnorm_id"),
-                d.get("brand_name"),
-                d.get("generic_name"),
-                d.get("synonyms"),
-            )
-            for d in rows
-        ]
-        extras.execute_values(cur, query, values)
+        extras.execute_values(cur, query, rows, page_size=500)
     conn.commit()
-    logger.info(f"✅ Updated {len(rows)} drugs with RxNorm data")
+    log.info("✅ Set rxnorm_id for %d rows", len(rows))
 
 
 # -------------------------
-# RxNorm API helpers
+# RxNav helpers
 # -------------------------
-def get_rxcui_by_name(name):
-    """Get RxCUI for a given drug name"""
+def http_get_json(url: str) -> Optional[dict]:
+    try:
+        r = requests.get(url, timeout=HTTP_TIMEOUT, headers={"User-Agent": "pharmaintel/1.0"})
+        if r.status_code == 200:
+            return r.json()
+        log.debug("RxNav non-200 %s for %s", r.status_code, url)
+    except requests.RequestException as e:
+        log.debug("RxNav error %s for %s", e, url)
+    return None
+
+
+def normalize_ndc_candidates(ndc_raw: str) -> Iterable[str]:
+    """
+    Produce a few common NDC formats to maximize hit rate.
+    - digits only (10 or 11)
+    - hyphenated 5-4-2 when length allows
+    """
+    if not ndc_raw:
+        return []
+    s = re.sub(r"[^0-9]", "", ndc_raw)
+    cands = set()
+
+    if len(s) in (10, 11):
+        # digits-only
+        cands.add(s)
+
+        # hyphenate as 5-4-2 when possible (most 11-digit GTIN-style)
+        if len(s) == 11:
+            a, b, c = s[:5], s[5:9], s[9:]
+            cands.add(f"{a}-{b}-{c}")
+        elif len(s) == 10:
+            # try 4-4-2, 5-3-2, 5-4-1
+            cands.add(f"{s[:4]}-{s[4:8]}-{s[8:]}")
+            cands.add(f"{s[:5]}-{s[5:8]}-{s[8:]}")
+            cands.add(f"{s[:5]}-{s[5:9]}-{s[9:]}")
+    return cands
+
+
+def rxcui_from_ndc(ndc: str) -> Optional[str]:
+    """NDC → RxCUI via /rxcui.json?ndc="""
+    for cand in normalize_ndc_candidates(ndc):
+        url = f"{RXNAV_BASE}/rxcui.json?ndc={cand}"
+        data = http_get_json(url)
+        if not data:
+            continue
+        rid = (data.get("idGroup") or {}).get("rxnormId")
+        if rid and len(rid) > 0:
+            return str(rid[0])
+    return None
+
+
+def clean_name(name: str) -> str:
+    """Strip strengths/forms to help approximateTerm hit."""
+    if not name:
+        return ""
+    s = name
+    s = re.sub(r"\(.*?\)", " ", s)                     # remove parentheticals
+    s = re.sub(r"\b\d+(\.\d+)?\s*(mg|mcg|g|iu|ml|mL|%|units)\b", " ", s, flags=re.I)
+    s = re.sub(r"\b(oral|tablet|capsule|solution|suspension|injection|spray|ointment|cream|patch|gel|extended release|er|xr)\b", " ", s, flags=re.I)
+    s = re.sub(r"[^A-Za-z0-9\s\-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def rxcui_from_name(name: str) -> Optional[str]:
+    """Name → RxCUI using approximateTerm (more forgiving than exact)."""
     if not name:
         return None
-    url = f"{RXNORM_API}/rxcui.json?name={requests.utils.quote(name)}"
+    term = clean_name(name)
+    if not term:
+        return None
+    url = f"{RXNAV_BASE}/approximateTerm.json?term={requests.utils.quote(term)}&maxEntries=1"
+    data = http_get_json(url)
+    if not data:
+        return None
     try:
-        resp = requests.get(url, timeout=10, headers={"User-Agent": "drug-pulse/1.0"})
-        if resp.status_code != 200:
+        cands = ((data.get("approximateGroup") or {}).get("candidate")) or []
+        if not cands:
             return None
-        data = resp.json()
-        return data.get("idGroup", {}).get("rxnormId", [None])[0]
+        return str(cands[0]["rxcui"])
     except Exception:
         return None
 
 
-def parse_rxnorm_names(rxcui):
-    """Fetch brand, generic, and synonyms from RxNorm"""
-    if not rxcui:
-        return None, None, None
-
-    url = f"{RXNORM_API}/rxcui/{rxcui}/allProperties.json?prop=names"
-    try:
-        resp = requests.get(url, timeout=10, headers={"User-Agent": "drug-pulse/1.0"})
-        if resp.status_code != 200:
-            return None, None, None
-        data = resp.json()
-
-        synonyms = []
-        brand_name, generic_name = None, None
-
-        for entry in data.get("propConceptGroup", {}).get("propConcept", []):
-            name = entry.get("propValue")
-            tty = entry.get("propCategory") or entry.get("propName")
-
-            if name:
-                synonyms.append(name)
-
-            if tty == "BN" and not brand_name:
-                brand_name = name
-            elif tty in {"IN", "GN"} and not generic_name:
-                generic_name = name
-
-        return brand_name, generic_name, ", ".join(synonyms) if synonyms else None
-
-    except Exception:
-        return None, None, None
-
-
 # -------------------------
-# Main ETL
+# Main
 # -------------------------
 def main():
-    conn = get_db_connection()
+    conn = get_db()
     try:
-        drugs = fetch_drugs_without_rxnorm(conn, LIMIT)
-        logger.info(f"Found {len(drugs)} drugs to enrich with RxNorm IDs")
+        rows = fetch_targets(conn, LIMIT)
+        log.info("Found %d rows to resolve (limit=%d)", len(rows), LIMIT)
 
-        enriched = []
-        for d in drugs:
-            name = d["preferred_name"] or d["generic_name"] or d["brand_name"]
-            if not name:
-                continue
+        updates: List[Tuple[int, str]] = []
 
-            rxcui = get_rxcui_by_name(name)
-            brand_name, generic_name, synonyms = (None, None, None)
+        for d in rows:
+            drug_id = d["id"]
+            ndc = d.get("product_ndc")
+            name = d.get("preferred_name") or d.get("generic_name") or d.get("brand_name")
+
+            rxcui: Optional[str] = None
+
+            # 1) NDC → RxCUI
+            if ndc:
+                rxcui = rxcui_from_ndc(ndc)
+
+            # 2) Fallback: approximateTerm(name)
+            if not rxcui and name:
+                rxcui = rxcui_from_name(name)
+
             if rxcui:
-                brand_name, generic_name, synonyms = parse_rxnorm_names(rxcui)
+                updates.append((drug_id, rxcui))
 
-            enriched.append({
-                "id": d["id"],
-                "rxnorm_id": rxcui,
-                "brand_name": brand_name,
-                "generic_name": generic_name,
-                "synonyms": synonyms
-            })
+            time.sleep(SLEEP)
 
-            time.sleep(0.2)  # polite delay
-
-        upsert_rxnorm_data(conn, enriched)
+        # Only write rows where we actually found an RxCUI
+        update_rxnorm_ids(conn, updates)
 
     finally:
         conn.close()
