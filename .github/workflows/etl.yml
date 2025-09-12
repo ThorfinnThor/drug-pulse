@@ -62,12 +62,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
-      - name: Run Drug Orangebook ETL
-        run: |
-          cd etl
-          python drugs_orangebook.py
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  
 
       - name: Refresh search materialized view
         run: |
