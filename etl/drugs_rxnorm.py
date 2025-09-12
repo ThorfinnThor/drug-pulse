@@ -1,56 +1,57 @@
 #!/usr/bin/env python3
 """
-RxNorm Enrichment ETL Script
-Enriches drugs in the database with RxNorm IDs, brand/generic names, synonyms.
-Falls back to FDA NDC fields if RxNorm is incomplete.
+drugs_rxnorm.py
+---------------
+Resolve RxNorm IDs (RxCUI) for drugs in the DB using RxNav API.
+Populates: rxnorm_id, brand_name, generic_name, synonyms.
+Keeps FDA preferred_name untouched.
 """
 
 import os
+import time
+import logging
 import requests
 import psycopg2
 from psycopg2 import extras
 from dotenv import load_dotenv
-import logging
-import time
 
-# =========================
-# CONFIG
-# =========================
-LIMIT = 100  # set limit for number of drugs per run
-RXNORM_API = "https://rxnav.nlm.nih.gov/REST"
-
-# Load env vars
+# -------------------------
+# Config
+# -------------------------
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
+RXNORM_API = "https://rxnav.nlm.nih.gov/REST"
+LIMIT = int(os.getenv("RXNORM_LIMIT", "100"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# =========================
-# DB Helpers
-# =========================
+# -------------------------
+# DB helpers
+# -------------------------
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
 
 def fetch_drugs_without_rxnorm(conn, limit=LIMIT):
-    """Fetch drugs missing RxNorm ID or names"""
+    """Fetch drugs missing RxNorm ID"""
     with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT id, preferred_name, generic_name, brand_name, rxcui, product_ndc
+            SELECT id, preferred_name, brand_name, generic_name
             FROM drugs
-            WHERE rxcui IS NULL OR generic_name IS NULL OR brand_name IS NULL
+            WHERE rxnorm_id IS NULL
+            ORDER BY id
             LIMIT %s
             """,
-            (limit,)
+            (limit,),
         )
         return cur.fetchall()
 
 
 def upsert_rxnorm_data(conn, rows):
-    """Bulk update drugs with RxNorm data (without overwriting preferred_name)"""
+    """Bulk update drugs with RxNorm data"""
     if not rows:
         return
 
@@ -58,17 +59,17 @@ def upsert_rxnorm_data(conn, rows):
         query = """
         UPDATE drugs AS d
         SET
-            rxcui = data.rxcui,
+            rxnorm_id = data.rxnorm_id,
             brand_name = COALESCE(data.brand_name, d.brand_name),
             generic_name = COALESCE(data.generic_name, d.generic_name),
-            synonyms = COALESCE(data.synonyms, d.synonyms)
-        FROM (VALUES %s) AS data(id, rxcui, brand_name, generic_name, synonyms)
+            rxnorm_synonyms = COALESCE(data.synonyms, d.rxnorm_synonyms)
+        FROM (VALUES %s) AS data(id, rxnorm_id, brand_name, generic_name, synonyms)
         WHERE d.id = data.id::int
         """
         values = [
             (
                 d["id"],
-                d.get("rxcui"),
+                d.get("rxnorm_id"),
                 d.get("brand_name"),
                 d.get("generic_name"),
                 d.get("synonyms"),
@@ -77,18 +78,19 @@ def upsert_rxnorm_data(conn, rows):
         ]
         extras.execute_values(cur, query, values)
     conn.commit()
-    logger.info(f"✅ Updated {len(rows)} drugs with RxNorm/FDA data (preferred_name unchanged)")
+    logger.info(f"✅ Updated {len(rows)} drugs with RxNorm data")
 
-# =========================
-# RxNorm API Helpers
-# =========================
+
+# -------------------------
+# RxNorm API helpers
+# -------------------------
 def get_rxcui_by_name(name):
     """Get RxCUI for a given drug name"""
     if not name:
         return None
     url = f"{RXNORM_API}/rxcui.json?name={requests.utils.quote(name)}"
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "drug-pulse/1.0"})
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -98,15 +100,15 @@ def get_rxcui_by_name(name):
 
 
 def parse_rxnorm_names(rxcui):
-    """Fetch brand, generic, preferred name, and synonyms from RxNorm"""
+    """Fetch brand, generic, and synonyms from RxNorm"""
     if not rxcui:
-        return None, None, None, None
+        return None, None, None
 
     url = f"{RXNORM_API}/rxcui/{rxcui}/allProperties.json?prop=names"
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "drug-pulse/1.0"})
         if resp.status_code != 200:
-            return None, None, None, None
+            return None, None, None
         data = resp.json()
 
         synonyms = []
@@ -121,25 +123,23 @@ def parse_rxnorm_names(rxcui):
 
             if tty == "BN" and not brand_name:
                 brand_name = name
-            elif tty == "IN" and not generic_name:
+            elif tty in {"IN", "GN"} and not generic_name:
                 generic_name = name
 
-        preferred_name = generic_name or brand_name or (synonyms[0] if synonyms else None)
-
-        return brand_name, generic_name, preferred_name, ", ".join(synonyms) if synonyms else None
+        return brand_name, generic_name, ", ".join(synonyms) if synonyms else None
 
     except Exception:
-        return None, None, None, None
+        return None, None, None
 
 
-# =========================
+# -------------------------
 # Main ETL
-# =========================
+# -------------------------
 def main():
     conn = get_db_connection()
     try:
         drugs = fetch_drugs_without_rxnorm(conn, LIMIT)
-        logger.info(f"Found {len(drugs)} drugs to enrich")
+        logger.info(f"Found {len(drugs)} drugs to enrich with RxNorm IDs")
 
         enriched = []
         for d in drugs:
@@ -147,30 +147,20 @@ def main():
             if not name:
                 continue
 
-            # 1️⃣ Try RxNorm lookup
-            rxcui = d.get("rxcui") or get_rxcui_by_name(name)
-            brand_name, generic_name, preferred_name, synonyms = (None, None, None, None)
+            rxcui = get_rxcui_by_name(name)
+            brand_name, generic_name, synonyms = (None, None, None)
             if rxcui:
-                brand_name, generic_name, preferred_name, synonyms = parse_rxnorm_names(rxcui)
-
-            # 2️⃣ Fallback to FDA NDC fields if RxNorm is missing
-            if not brand_name and d.get("brand_name"):
-                brand_name = d["brand_name"]
-            if not generic_name and d.get("generic_name"):
-                generic_name = d["generic_name"]
-            if not preferred_name:
-                preferred_name = brand_name or generic_name or d.get("preferred_name")
+                brand_name, generic_name, synonyms = parse_rxnorm_names(rxcui)
 
             enriched.append({
                 "id": d["id"],
-                "rxcui": rxcui,
+                "rxnorm_id": rxcui,
                 "brand_name": brand_name,
                 "generic_name": generic_name,
-                "preferred_name": preferred_name,
                 "synonyms": synonyms
             })
 
-            time.sleep(0.2)  # avoid API rate limit
+            time.sleep(0.2)  # polite delay
 
         upsert_rxnorm_data(conn, enriched)
 
